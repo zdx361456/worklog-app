@@ -54,7 +54,8 @@ rem    主位置（唯一权威）：
 rem      <工程>\release\worklog-release-latest.apk       <- 永远是最新那一版
 rem    每次重新生成时，上一版会被自动重命名成：
 rem      <工程>\release\worklog-release-<被替换时间>-replaced.apk
-rem    历史只增不删、不会丢；桌面仍各放一份带构建时间戳的副本，方便直接取用。
+rem    历史只增不删、不会丢。桌面另投一份【固定名】worklog-release-latest.apk，
+rem    覆盖式更新（不带时间戳 —— 否则每构建一次就多出 55MB，还要被 OneDrive 同步上传）。
 rem    交付逻辑整体在 publish_apk.py 里（可单独跑自测），bat 只负责调用与判定。
 rem ===========================================================================
 
@@ -163,6 +164,11 @@ echo.
 echo    最新安装包（唯一权威位置）：
 echo      %LATEST%
 echo.
+echo    ---- 本次投递明细（OK=已投到；SKIP=该位置不存在；FAIL=投递失败）----
+rem [修复六 · 独立复核 F-N6] 把 publish 的投递结果回显到成功横幅里。
+rem   否则桌面副本失败（RESULT=OK_WITH_WARNINGS）时，用户只会看到"成功"两个大字。
+findstr /b "RESULT= DESK_" "%REPORT%"
+echo.
 echo    怎么装到手机上：
 echo      1) 手机用数据线连电脑，把这个文件拷进手机，在手机上点开安装；
 echo         或直接用 adb 安装（本机已装 platform-tools）。
@@ -182,7 +188,7 @@ echo.
 echo ==========================================================
 echo    【失败】构建成功了，但"发布/取件"这一步失败
 echo    详细记录：%REPORT%
-echo    完整构建日志：%LOG%
+echo    构建输出日志：%LOG%
 echo    把这两个文件发给 WorkBuddy，我就能定位原因。
 echo ==========================================================
 goto :tail
@@ -196,7 +202,7 @@ echo    重要：%REL% 下面那些 worklog-release-*.apk 都是以前构建
 echo          留下的旧包，不包含这次的最新改动，请不要安装它们
 echo          （装了也看不出任何变化）。
 echo.
-echo    完整日志：%LOG%
+echo    构建输出日志：%LOG%
 echo    把这个日志文件发给 WorkBuddy，我就能定位原因。
 echo ==========================================================
 echo.

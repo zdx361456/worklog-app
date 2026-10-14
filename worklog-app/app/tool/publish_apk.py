@@ -136,7 +136,10 @@ def _run(src, release_dir, stamp, desks, report_path):
     latest = os.path.join(release_dir, LATEST_NAME)
 
     # ---- 2. 先把新包拷到临时位并校验，再动旧版 ----
-    #      这样即使中途失败，也不会出现"旧的已挪走、新的还没上位"的空档。
+    #      这样绝大多数中途失败（拷贝失败、源损坏）都不会动到旧版。
+    #      ★ 但要注意：第 4 步 os.replace(tmp->latest) 若失败，确实会出现
+    #      「旧版已挪到 -replaced、latest 暂缺」的窗口（独立复核 2026-10-14 实测）。
+    #      因此第 4 步失败时会尝试自动回滚，把旧版搬回 latest。
     tmp = os.path.join(release_dir, '.tmp-publish-%s.apk' % stamp)
     try:
         shutil.copy2(src, tmp)
@@ -169,7 +172,18 @@ def _run(src, release_dir, stamp, desks, report_path):
     try:
         os.replace(tmp, latest)
     except OSError as exc:
-        return _fail(report_path, '新包上位失败：%s' % exc, lines)
+        # [修复 F-N2 · 2026-10-14] 独立复核注入实测：这一步失败会让最新位短暂缺失
+        # （旧版已挪到 -replaced、新版还留在 .tmp-publish-*）。
+        # 所以这里主动回滚：把刚归档的旧版搬回最新位，保证"最新位永远有一份可装的包"。
+        if rotated and not os.path.exists(latest):
+            try:
+                os.replace(rotated, latest)
+                note = '（已自动回滚：上一版已搬回最新位，latest 未受影响）'
+            except OSError as rb:
+                note = '（自动回滚失败：%s；上一版仍在 %s，新版在 %s）' % (rb, rotated, tmp)
+        else:
+            note = ''
+        return _fail(report_path, '新包上位失败：%s %s' % (exc, note), lines)
     if not os.path.isfile(latest):
         return _fail(report_path, '最新位不存在：%s' % latest, lines)
     if os.path.getsize(latest) != src_size:
