@@ -9,15 +9,35 @@
 #   3. 逐项执行。「一次送一批」出现部分失败时无法定位是谁，所以逐项。
 #   4. 判成功只看 in_recycle_bin（回收站 $I 记录里按原路径查到）。
 #      rc 不可信 —— 实测出现过 rc=120 但操作实际成功。
-#   5. 白名单 + 保护名单双闸门。只在 ROOT/_scratch 之下动手；源码、文档、
-#      交付目录、git 目录在保护名单里，命中即拒绝执行整体退出。
+#   5. 双闸门。① 范围闸门：候选必须在 ROOT 之下，出界即整体放弃（防误伤别的仓库）。
+#      ② 保护名单：源码 / 文档 / 工具链 / git / 交付目录命中即整体退出。
+#      另有 ALLOWED 白名单，从「整体拒绝」里摘出明确允许清理的窄类别
+#      （目前只有 worklog-app/app/release/*-replaced.apk）。
+#   6. 新增候选组时，必须同步评审 ALLOWED。闸门②是「命中即整体退出」的全有全无
+#      语义：只要一个候选落在受保护目录内，整批（含无关组）都会被拒。历史教训 ——
+#      build 组清 app/release/*-replaced.apk 曾让整脚本 exit 1，清理功能不可用。
+#      已知限制（latent）：ROOT 路径含空格时 add_glob 的 glob 展开会发生词分割 →
+#      **候选失真**（既可能漏收，也可能把工作区外的路径收进候选）。安全性**靠闸门 0
+#      兜底**（出界候选 → rc=1 整体放弃），**不是**靠「只会漏收」—— 故闸门 0 不可
+#      移除、不可重排到闸门①之前。本工作区路径无空格，未触发。
 #
 #  用法：
 #      bash tool/cleanup.sh                    列出全部候选（不改动）
-#      bash tool/cleanup.sh --only dill        只看某一组
+#      bash tool/cleanup.sh --only <组名>      只看某一组
 #      bash tool/cleanup.sh --apply --yes      真的送回收站（不问）
 #      bash tool/cleanup.sh --apply            真的送回收站（逐组二次确认）
 #      bash tool/cleanup.sh -h
+#
+#  候选组名（--only 的取值）：
+#      dill        Dart 中间编译产物 *.dill
+#      reviews     复核官工作目录（app 内）
+#      sdk         旧 Dart/Flutter SDK 试验残留
+#      checktmp    APK 校验临时副本
+#      revold      早期复核工作目录（工作区级）
+#      appscratch  worklog-app/_scratch 整目录
+#      build       构建产物（.dart_tool / build/ / 旧交付包 / 出包历史副本 / 复刻件）
+#      scratchall  worklog-app/app/_scratch 整目录（与 dill、reviews 重叠，二选一）
+#      junk        诊断 / 日志残留
 # ===========================================================================
 set -uo pipefail
 
@@ -32,13 +52,25 @@ APPLY=0
 ASSUME_YES=0
 ONLY=""
 
-usage() { sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+# 从本文件头部注释块提取用法（单一来源，避免两份文案漂移）。
+# 范围 = 第 2 行起，到**下一个** `# ===` 分界行（含）。用正则而非固定行号，
+# 这样以后在头部增删注释行都不必同步改这里。sed 的 addr2 正则是从
+# 起始行的下一行开始匹配，所以第 2 行自身不会提前终止范围。
+usage() { sed -n '2,/^# =====/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --apply)     APPLY=1; shift ;;
     --yes|-y)    ASSUME_YES=1; shift ;;
-    --only)      ONLY="${2:-}"; shift 2 ;;
+    --only)
+      # 缺值守卫（NEW-01）：--only 是最后一个参数时 `shift 2` 会失败，但失败
+      #   并不改变 $#，于是 `while [ $# -gt 0 ]` 原地打转 —— 实测直接挂死
+      #   （timeout 5 → rc=124，且无任何输出）。必须显式拦下。
+      [ $# -ge 2 ] || { echo "[X] --only 缺少组名（例：--only build）" >&2; usage >&2; exit 2; }
+      # 显式空串（--only ""）不当成「全部」（NEW-02）：否则与「不传 --only」
+      #   语义混淆，用户以为只看了一组、其实跑的是全部。
+      [ -n "$2" ] || { echo "[X] --only 的组名不能为空；要看全部请直接不传 --only" >&2; usage >&2; exit 2; }
+      ONLY="$2"; shift 2 ;;
     -h|--help)   usage; exit 0 ;;
     *) echo "[X] 未知参数: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -72,6 +104,12 @@ add_glob() {  # add_glob <显示名> <glob...>
   local p f
   for p in "$@"; do
     for f in $p; do
+      # 只收真实存在的路径。
+      # 为什么必需：调用点会同时传「glob 实参」和「字面量兜底实参」——字面量不做
+      #   路径展开，哪怕目标不存在也会原样返回。不校验就会把不存在的路径计入候选，
+      #   使 DRY-RUN 清单虚增，并在执行阶段平白多出一批 absent 噪音。
+      #   （独立审查官实测：9 项候选里 8 项其实不存在。）
+      [ -e "$f" ] || continue
       TARGETS+=("$f")
       found=$((found+1))
     done
@@ -114,6 +152,28 @@ fi
 if want appscratch; then
   add_glob "appscratch  worklog-app/_scratch 整目录" "${ROOT}/worklog-app/_scratch"
 fi
+if want build; then
+  # 构建产物类：全部可再生 —— .dart_tool 由 build_apk.bat:173 的 flutter pub get 重建，
+  # build/ 由 flutter build 重建。
+  add_literal "build  Dart 中间产物 .dart_tool（flutter pub get 可重建）" "${ROOT}/worklog-app/app/.dart_tool"
+  add_literal "build  Flutter/Gradle 输出 build/（可再生）" "${ROOT}/worklog-app/app/build"
+  # 目录内旧包：受保护目录 app/release 之下，靠闸门 1 的 ALLOWED 白名单显式放行
+  add_glob "build  被替换的旧版交付 APK" "${ROOT}/worklog-app/app/release/"*-replaced.apk
+  add_literal "build  publish_apk 自测夹具 _pubtest" "${ROOT}/_scratch/_build/_pubtest"
+  # 出包历史副本：注意 _scratch/_build 同时是本脚本的报告目录（REPORT_DIR），
+  #   所以只收该目录下的 *.apk，**不要**把 _scratch/_build 本身列入候选。
+  add_glob "build  出包历史副本" "${ROOT}/_scratch/_build/"*.apk
+  # 复刻实验件：这些目录没有固定清单，只能按命名约定 _replica* 前缀匹配
+  add_glob "build  复刻实验件" "${ROOT}/_scratch/_replica"*
+fi
+if want scratchall; then
+  # 注意：本组与 dill / reviews 组存在**包含关系**（整目录盖住了组内子项）。
+  #   用 --only 时请二选一；两项同时入选时，add_glob 的存在性校验会把已被
+  #   前一组清掉的子项过滤掉，不会产生幽灵候选。
+  add_literal "scratchall  worklog-app/app/_scratch 整目录（含 .dill 与各 worker 目录）" "${ROOT}/worklog-app/app/_scratch"
+  # 注：worklog-app/app_backup_before_scaffold 曾列入本组，已移除 —— 它**被 git 跟踪**，
+  #   清理会产生工作树删除变更并需额外提交，且仅 121 KB，判定为「保守保留」。
+fi
 if want junk; then
   add_glob "junk  诊断/日志残留" \
     "${ROOT}/_scratch/_build/_probe"*.bat \
@@ -149,28 +209,62 @@ done
 }
 
 # ---- 保护名单：命中即整体拒绝 --------------------------------------------
-PROTECTED=(
+# 两类语义不同，不要合并：
+#   PROTECTED_PREFIX 目录型 —— 连它的子项一起保护（整棵子树都不能碰）
+#   PROTECTED_EXACT  精确型 —— 只保护这个路径本身
+PROTECTED_PREFIX=(
   "${ROOT}/.git"
   "${ROOT}/tool"
-  "${ROOT}/README.md"
-  "${ROOT}/.gitignore"
-  "${ROOT}/build_apk.bat"
   "${ROOT}/worklog-app/docs"
   "${ROOT}/worklog-app/app/lib"
   "${ROOT}/worklog-app/app/android"
   "${ROOT}/worklog-app/app/test"
   "${ROOT}/worklog-app/app/tool"
   "${ROOT}/worklog-app/app/release"
+)
+PROTECTED_EXACT=(
+  "${ROOT}/README.md"
+  "${ROOT}/.gitignore"
+  "${ROOT}/build_apk.bat"
   "${ROOT}/worklog-app/app/pubspec.yaml"
   "${ROOT}/worklog-app/app/pubspec.lock"
 )
+
+# 例外白名单：受保护目录内「明确允许清理」的产物。**例外不改保护语义**——
+# app/release 子树照旧受保护，只是从「整体拒绝」里摘出下面这一个明确类别。
+# 为什么必须有它：闸门 1 是前缀匹配（"$p"|"$p"/*），app/release 在前缀组里；
+#   若不放行这条例外，只要目录里存在一个被替换的旧包，整批清理就永远 exit 1
+#   —— 连别的组也跑不了（已由独立审查官复刻实证）。
+# 设计约束：只放**窄模式**（带后缀限定），绝不要写成 app/release/*。
+# 另：只收「普通文件」（NEW-03）—— 若恰好有个**目录**叫 xxx-replaced.apk/，
+#   放行它等于放行整棵子树，故用 -f 过滤掉。
+ALLOWED=()
+for _a in "${ROOT}/worklog-app/app/release/"*-replaced.apk; do
+  [ -f "$_a" ] && ALLOWED+=("$_a")
+done
+unset _a
+
 VIOLATION=0
 for t in "${TARGETS[@]}"; do
-  for p in "${PROTECTED[@]}"; do
-    case "$t" in
-      "$p"|"$p"/*) echo "[X] 候选命中保护名单，拒绝执行：$t"; VIOLATION=1 ;;
-    esac
+  # 例外优先：命中白名单 → 只跳过「保护名单」判定；「顶层目录」判定仍然生效
+  _allowed=0
+  for a in ${ALLOWED[@]+"${ALLOWED[@]}"}; do
+    [ "$t" = "$a" ] && { _allowed=1; break; }
   done
+
+  if [ "$_allowed" != "1" ]; then
+    for p in "${PROTECTED_PREFIX[@]}"; do
+      case "$t" in
+        "$p"|"$p"/*) echo "[X] 候选命中保护名单（目录，含子项），拒绝执行：$t"; VIOLATION=1 ;;
+      esac
+    done
+    for p in "${PROTECTED_EXACT[@]}"; do
+      case "$t" in
+        "$p") echo "[X] 候选命中保护名单（精确），拒绝执行：$t"; VIOLATION=1 ;;
+      esac
+    done
+  fi
+
   case "$t" in
     "${ROOT}"|"${ROOT}/_scratch"|"${ROOT}/worklog-app") echo "[X] 候选是顶层目录，拒绝执行：$t"; VIOLATION=1 ;;
   esac
@@ -183,8 +277,12 @@ echo " 清理候选   仓库根: ${ROOT}"
 echo "            分组:"
 for g in "${GROUP_NAMES[@]}"; do echo "               - ${g}"; done
 echo "            合计: ${#TARGETS[@]} 项"
-if TOTAL="$(du -sc "${TARGETS[@]}" 2>/dev/null | tail -1 | cut -f1)"; then
+if TOTAL="$(du -sc "${TARGETS[@]}" 2>/dev/null | tail -1 | cut -f1)" && [ -n "$TOTAL" ]; then
   echo "            体积: $(awk -v k="$TOTAL" 'BEGIN{printf "%.2f GB", k/1048576}')  (${TOTAL} KB)"
+else
+  # 不让它静默消失（NEW-04）：du 失败（权限/IO）时明说是「未知」，
+  #   否则读的人会以为「没有体积行 = 没有候选」。
+  echo "            体积: 未知（du 未能计算；不影响清单本身与执行）"
 fi
 [ "$APPLY" = "1" ] && echo "            模式: APPLY —— 会真的送入回收站" \
                    || echo "            模式: DRY-RUN —— 只列清单，不动任何东西"

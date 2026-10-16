@@ -1,0 +1,25 @@
+# ===========================================================================
+#  换行符统一 —— 避免在别的机器 clone 之后脚本跑不起来
+#
+#  背景：本仓库 core.autocrlf=true。若不显式声明，checkout / clone 时 *.sh 会被
+#        转成 CRLF，在 Git Bash 下执行会报 "$'\r': command not found"。
+#
+#  实测依据（2026-10-16）：`git ls-files --eol` 显示 build_apk.bat 的工作区副本
+#  已是 w/crlf（索引 i/lf）—— 说明该转换机制在本机确实生效；tool/*.sh 之所以
+#  现在还是 LF，只是因为它们提交后尚未经过一次 checkout。也就是说这个坑是
+#  「迟早会踩」而不是「不会踩」。
+#
+#  规则：
+#    .sh / .py   必须 LF   —— Git Bash、Python 解释器都按 LF 解析
+#    .bat / .cmd 必须 CRLF —— cmd.exe 对 LF 容错差，label / goto 会出错
+#    其余文本      交给 git 规范化（text=auto）
+#
+#  注意：eol=xxx 只决定**工作区**的换行；索引里一律存 LF。所以加了这个文件
+#  不会产生内容变更，只是把 checkout 行为钉死。
+# ===========================================================================
+* text=auto
+
+*.sh   text eol=lf
+*.py   text eol=lf
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
