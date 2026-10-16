@@ -46,6 +46,22 @@
 ///     `replaceWorkRecordSnapshot` 仅覆盖快照块、可空列传 null → 清空、非空列传 null → 保留。
 /// 10. 【反证】事务内调用**公开**方法会超时（**只认 `TimeoutException` 或 sqflite 重入/锁定错误**，
 ///     其它异常单独报、不计入死锁），证明 C-01 原缺陷真实存在。
+/// 11. **断言加固轮**（2026-10-16，消除独立变异测试审计实测的 G1~G7 逃逸 + S1 结构缺陷）：
+///     - **G3**（最严重）：`aggregateByCompany.remaining` 此前**从不比对**——把 `:377` 的
+///       `receivable - received` 反成 `received - receivable` 仍全绿，而 P06 公司列表页每行剩余
+///       正是取此字段。→ 补「派生一致 + 与 service 逐字段一致 + 绝对值锚点（公司C 18000 / 公司D 6000）」；
+///     - **G1/G2**：`listWorkRecords` / `listPaymentRecords` 的**默认软删过滤**（`:1262` / `:1288`）
+///       此前从未被调用（§5/§6 只验聚合 SQL）→ 补夹具断言（条数 + 差值 + every(!isDeleted)）；
+///     - **G7**：`listWorkRecords(includeDraft:false)`（`:1263`，即 `calendar_page.dart:93` 在用、
+///       AC-P03-04 日历色点口径）此前从未被调用 → 补「排除草稿 + 条数 + 前后差值」；
+///     - **G5/G6**：`listCompanies`（`:472`）/ `listPricingRules`（`:557`）的**软删过滤**此前无断言
+///       （§7 只验了 `enabled` 过滤）→ 补软删前后断言；
+///     - **G4**：`_recordStatus` 脏状态兜底方向（`database.dart:1638-1640`，M-03 修复本身）
+///       此前**零用例** → 新增 §8d：绕过模型直改 `status` 列为未知值，三条断言覆盖
+///       ①行映射兜底 `draft`、②**行读派生**（`ReceivableService` 按解析枚举累加——
+///       这是兜底方向反转时「剩余虚增」的真实风险路径）、③SQL 聚合力保「原始字符串过滤」事实；
+///     - **S1**：`main()` 外层加**全局异常兜底**——实现侧抛未捕获异常时必定打印
+///       `结果：N 通过 / M 失败` 并 exit=1（旧行为是 exit=255，且其后 36 条断言被静默掩盖）。
 ///
 /// 注记（与 `test/receivable_parity_test.dart` 的关系）：本脚本打印的 **§6「aggregate 与
 /// ReceivableService 口径一致（d-02）」** 与 `test/receivable_parity_test.dart` **语义等价**——
@@ -198,6 +214,26 @@ HolidayMark _holiday(String id, DateTime date) => HolidayMark(
     );
 
 Future<void> main() async {
+  // ── S1 加固（2026-10-16）：脚本级异常兜底 ──
+  // 加固前：实现侧一旦抛未捕获异常（实测 `_parseLenient` 的 catch 体改成 `rethrow`），
+  // 脚本直接崩溃 exit=255，**不打印 `结果：N 通过 / M 失败`**，且其后 36 条断言
+  // （§8b 尾部 + §8c + §9 + §10）**全部被掩盖**，违反「单点归因」纪律（无法判断是
+  // 哪条断言红了、也看不出还有多少断言没跑）。
+  // 加固后：任何未捕获异常都计入失败数、打印结果行、exit=1 —— 「崩溃」与「置红」在
+  // 退出码与结果行上均可区分且必定可见，断言不再被静默掩盖。
+  try {
+    await _run();
+  } catch (e, st) {
+    _fail++;
+    print('  ✗ 【脚本级异常】实现抛出未捕获异常，脚本提前终止（断言未跑完）：');
+    print('    ${e.runtimeType}: $e');
+    print('    ${st.toString().split('\n').take(3).join('\n    ')}');
+    print('\n结果：$_pass 通过 / $_fail 失败  （⚠️ 未跑完全部断言，异常见上）');
+    exit(1);
+  }
+}
+
+Future<void> _run() async {
   _maybePreloadSystemSqlite();
   // sqflite 在纯 Dart 下必须用 ffi 工厂 + 内存库（不落盘）
   sqfliteFfiInit();
@@ -423,7 +459,75 @@ Future<void> main() async {
           'row=$row');
       check('[$cid] aggregateByCompany 已收一致',
           row.length == 1 && row.first.received == s.received, 'row=$row');
+      // ── G3 加固（2026-10-16）：此前只比 receivable / received，**从不比 remaining**。
+      // 实测：把 `database.dart:377` 的 `remaining: receivable - received` 反成
+      // `received - receivable`（符号翻转）后，本脚本仍报 93/0 全绿。
+      // 而公司列表页（P06）**每行剩余正是取此字段** → 全表剩余变负号而无人察觉。
+      // 补两条：① 结构派生一致性（不信任实现自带的自洽性）；② 与 service 纯函数逐字段一致。
+      check('[$cid] aggregateByCompany 剩余 == 应收 − 已收（派生一致，可捕获符号翻转）',
+          row.length == 1 &&
+              row.first.remaining == row.first.receivable - row.first.received,
+          'row=$row');
+      check('[$cid] aggregateByCompany 剩余 == service 剩余（逐字段口径一致）',
+          row.length == 1 && row.first.remaining == s.remaining, 'row=$row');
     }
+
+    // ── G3 绝对值锚点（防「两边同错」）：剩余必须是可心算的确定值 ──
+    // 公司C：应收 30000（10000 confirmed + 20000 settled，草稿 9999 与软删 5000 均排除）
+    //        已收 12000（软删的 3000 排除） → 剩余 18000
+    // 公司D：应收 7000 / 已收 1000 → 剩余 6000
+    final bcC = byCompany.where((e) => e.companyId == _companyC).toList();
+    final bcD = byCompany.where((e) => e.companyId == _companyD).toList();
+    check('公司C aggregateByCompany 应收 = 30000',
+        bcC.length == 1 && bcC.first.receivable == 30000, 'row=$bcC');
+    check('公司C aggregateByCompany 已收 = 12000',
+        bcC.length == 1 && bcC.first.received == 12000, 'row=$bcC');
+    check('公司C aggregateByCompany 剩余 = 18000（P06 公司列表页每行剩余来源）',
+        bcC.length == 1 && bcC.first.remaining == 18000, 'row=$bcC');
+    check('公司D aggregateByCompany 剩余 = 6000（7000 − 1000）',
+        bcD.length == 1 && bcD.first.remaining == 6000, 'row=$bcD');
+
+    // ── G1 / G2 / G7 加固（2026-10-16）：**行读路径**的默认过滤口径 ──
+    // 此前 §6 只验了**聚合 SQL** 的过滤；`listWorkRecords` / `listPaymentRecords` 的
+    // 默认软删过滤（`database.dart:1262` / `:1288`）与 `listWorkRecords(includeDraft:false)`
+    // （`:1263`，即 `calendar_page.dart:93` 在用、AC-P03-04 日历色点口径）**从未被调用**。
+    // 实测：三处各自改成 `if (false)` 后仍 93/0 全绿。
+    // 夹具（公司C）：工作记录 4 条 = confirmed 10000 / settled 20000 / draft 9999 / 软删 5000
+    //               收款记录 2 条 = 12000 / 软删 3000
+    final cRowsDefault = await db.listWorkRecords(companyId: _companyC);
+    check('软删排除 G1：listWorkRecords 默认不含已软删记录',
+        cRowsDefault.every((r) => !r.isDeleted),
+        'deletedAt 序列=${cRowsDefault.map((r) => r.deletedAt).toList()}');
+    check('软删排除 G1：listWorkRecords 默认 公司C = 3 条（含草稿、排除软删）',
+        cRowsDefault.length == 3, '实际 ${cRowsDefault.length}');
+    final cRowsAll =
+        await db.listWorkRecords(companyId: _companyC, includeDeleted: true);
+    check('软删排除 G1：includeDeleted 前后差值 = 1（恰 1 条软删）',
+        cRowsAll.length == cRowsDefault.length + 1,
+        'default=${cRowsDefault.length} all=${cRowsAll.length}');
+
+    final cPayDefault = await db.listPaymentRecords(companyId: _companyC);
+    check('软删排除 G2：listPaymentRecords 默认不含已软删收款',
+        cPayDefault.every((p) => !p.isDeleted),
+        'deletedAt 序列=${cPayDefault.map((p) => p.deletedAt).toList()}');
+    check('软删排除 G2：listPaymentRecords 默认 公司C = 1 条',
+        cPayDefault.length == 1, '实际 ${cPayDefault.length}');
+    final cPayAll =
+        await db.listPaymentRecords(companyId: _companyC, includeDeleted: true);
+    check('软删排除 G2：includeDeleted 前后差值 = 1（恰 1 条软删）',
+        cPayAll.length == cPayDefault.length + 1,
+        'default=${cPayDefault.length} all=${cPayAll.length}');
+
+    final cNoDraft =
+        await db.listWorkRecords(companyId: _companyC, includeDraft: false);
+    check('AC-32 G7：listWorkRecords(includeDraft:false) 排除草稿（P03 日历色点口径）',
+        cNoDraft.every((r) => r.status != RecordStatus.draft),
+        '状态序列=${cNoDraft.map((r) => r.status).toList()}');
+    check('AC-32 G7：includeDraft:false 公司C = 2 条（confirmed + settled）',
+        cNoDraft.length == 2, '实际 ${cNoDraft.length}');
+    check('AC-32 G7：includeDraft true/false 差值 = 1（草稿恰 1 条）',
+        cRowsDefault.length == cNoDraft.length + 1,
+        'true=${cRowsDefault.length} false=${cNoDraft.length}');
   }
 
   // ═══════════════════════════════════════════════════════════════
@@ -474,7 +578,29 @@ Future<void> main() async {
         (await db.listPricingRules(companyId: companyE)).isEmpty);
     check('R2-06 listPricingRules(includeDisabled:true) 含停用规则（对称）',
         (await db.listPricingRules(companyId: companyE, includeDisabled: true)).length == 1);
-    await db.softDeleteCompany(companyE, _now); // 清理
+
+    // ── G6 加固（2026-10-16）：此前 §7 只验了 listPricingRules 的 **enabled** 过滤，
+    // 其 **软删** 过滤（`database.dart:557` 的 `if (!includeDeleted) 'deleted_at IS NULL'`）
+    // 无任何断言 —— 实测改成 `if (false)` 后仍 93/0 全绿 → 已删规则会串进新建选择器。
+    await db.softDeletePricingRule(ruleF, _now);
+    check('规则软删排除 G6：listPricingRules(includeDisabled:true) 不含已软删规则',
+        (await db.listPricingRules(companyId: companyE, includeDisabled: true)).isEmpty);
+    check('规则软删排除 G6：includeDeleted:true 时含已软删规则（差值 = 1）',
+        (await db.listPricingRules(
+                companyId: companyE, includeDeleted: true, includeDisabled: true))
+            .length ==
+            1);
+
+    // ── G5 加固（2026-10-16）：同理，listCompanies 的**软删**过滤（`:472`）此前无断言 ──
+    await db.softDeleteCompany(companyE, _now); // 清理 + 兼作 G5 夹具
+    final afterSoftDel =
+        await db.listCompanies(ledgerId: _ledgerId, includeDisabled: true);
+    check('公司软删排除 G5：listCompanies(includeDisabled:true) 不含已软删公司',
+        afterSoftDel.every((c) => c.id != companyE),
+        'ids=${afterSoftDel.map((c) => c.id).toList()}');
+    check('公司软删排除 G5：软删前后差值 = 1（停用公司 E 恰 1 家）',
+        afterSoftDel.length == all.length - 1,
+        'before=${all.length} after=${afterSoftDel.length}');
   }
 
   // ═══════════════════════════════════════════════════════════════
@@ -821,6 +947,50 @@ Future<void> main() async {
     final healed8c = (await db.aggregate(_companyB)).received;
     check('Minor-1/4 收尾：清理后 aggregate 恢复（received=0）', healed8c == 0,
         '实际 received=$healed8c');
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  print('== 8d. 脏状态兜底方向（M-03）：未知 status 必须兜底为 draft，不得虚增应收 ==');
+  // ═══════════════════════════════════════════════════════════════
+  {
+    // G4 加固（2026-10-16）：头部 M-03 声称「`_recordStatus` 兜底方向必须安全」
+    // （`database.dart:1638-1640`，已从 `confirmed` 纠正为 `draft`），但**此前没有任何
+    // 脏状态用例**——实测把兜底改回 `RecordStatus.confirmed` 后仍 93/0 全绿。
+    // 风险方向正是 M-03 当初要防的：脏状态行被计入应收 → **剩余工资虚增**。
+    // 手法：先用模型写入一条**合法**记录（保证所有 NOT NULL 列齐全），再绕过模型把
+    // `status` 列直改成模型不认识的字符串（模拟外部改库 / 版本回退 / 手工修库）。
+    const dirtyStatusId = 'b0111111-1111-4111-8111-111111111111';
+    const companyH = 'aaaaaaaa-9999-4999-8999-999999999999';
+    await db.upsertCompany(_company(companyH, '脏状态测试公司'));
+    await db.upsertWorkRecord(_work(dirtyStatusId, companyH, 50000));
+    await db.transaction((txn) async {
+      await txn.update('work_record', {'status': 'bogus_status_xyz'},
+          where: 'id = ?', whereArgs: [dirtyStatusId]);
+    });
+
+    // ① 行映射路径（M-03 修复本体的**直接**断言）
+    final dirtyRow = await db.getWorkRecord(dirtyStatusId);
+    check('M-03 脏状态兜底方向：未知 status → draft（不虚增）',
+        dirtyRow?.status == RecordStatus.draft, '实际 ${dirtyRow?.status}');
+
+    // ② **风险路径**：行读后被 `ReceivableService` 按**解析后的枚举**判 status 再累加。
+    // 若兜底方向变成 `confirmed`，这行会被计入应收 → **剩余工资虚增**（M-03 当初要防的方向）。
+    // —— 实测：把 `:1640` 改回 `RecordStatus.confirmed` 时本条置红。
+    const svc8d = ReceivableService();
+    final hRows = await db.listWorkRecords(companyId: companyH);
+    check('M-03 脏状态行经 ReceivableService 派生不计入应收（兜底 draft → 0）',
+        svc8d.receivable(hRows) == 0 && hRows.length == 1,
+        'rows=${hRows.length} svc应收=${svc8d.receivable(hRows)}');
+
+    // ③ SQL 聚合路径：`status` 列以**原始字符串**参与 `WHERE`，脏值不在 `('confirmed','settled')`
+    //    内 → 天然不计入。此处把该事实固化下来（防日后被改成「先解析再过滤」而引入虚增），
+    //    并同时确认「公司H 不出现在 P06 的分组聚合里」。
+    final hAgg = await db.aggregate(companyH);
+    final hByCompany = await db.aggregateByCompany();
+    final hRow = hByCompany.where((e) => e.companyId == companyH).toList();
+    check('M-03 脏状态行不计入 SQL 聚合（原始值不在 confirmed/settled；含 P06 分组）',
+        hAgg.receivable == 0 && hAgg.remaining == 0 && hRow.isEmpty,
+        'agg应收=${hAgg.receivable} byCompany=$hRow');
   }
 
   // ═══════════════════════════════════════════════════════════════
