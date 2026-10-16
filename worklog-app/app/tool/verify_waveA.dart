@@ -24,6 +24,11 @@
 ///  6. **边界形态**（AC-P01-01 / AC-PDBT-10）：停用公司、已归档公司**仍计入**（「有账必列」）；
 ///     **只有草稿的公司不出现**在 `aggregateByCompany()`；**全多收**时 `debtTotal == 0` 而恒等式仍成立；
 ///  7. **逐公司一致**（AC-P01-11 / AC-P07-11）：`aggregate(cid)` 与 `aggregateByCompany()` 同一行三字段相等。
+///  8. **UI 接线静态断言（§10，堵审计 F1~F3 逃逸）**：§1~§9 只证「数据层/接口常数」正确，
+///     **不证页面接线**（审计 `03-verify_waveA 与 waveA2.md` §4.1 系统性结论）。§10 因此**读
+///     `lib/ui/**` 真实源码、剥注释后**对**页面调用点实参**做精确锚定：P-DEBT 页面口径公式（F1a/F1b）、
+///     三处 `listCompanies` 双 `true`（F3a/F3b/F3c）、下钻 `RecordsFilter` 实参（F2a/F2b）、
+///     点卡片→P07 等 U-4 接线。手法与 `tool/verify_waveD2.dart` 静态层一致（剥注释 + 切方法体 + 精确计数）。
 ///
 /// **测试数据（整数「分」，刻意让四种形态同时出现）**：
 /// ```
@@ -76,6 +81,49 @@ void check(String name, bool ok, [String? detail]) {
     _fail++;
     print('  ✗ $name${detail == null ? '' : '  ($detail)'}');
   }
+}
+
+// ── 静态源码工具（§10 用：读真实 lib/ui 源码 → 剥注释 → 精确锚定/计数）──────────
+// 手法照抄本项目唯一 0 假覆盖脚本 `tool/verify_waveD2.dart:98-227`：
+//   `_stripComments`（整行 + 行尾注释都剥）、`_blockAfter`（切方法/构造块）、`_count`（精确计数）。
+final RegExp _commentRe = RegExp(r'(^|\s)//.*$', multiLine: true);
+
+String _stripComments(String src) => src.replaceAll(_commentRe, '');
+
+String _read(String relPath) {
+  final f = File(relPath);
+  return f.existsSync() ? f.readAsStringSync() : '';
+}
+
+/// `needle` 在 `code` 中的**总出现次数**（不重叠）。
+int _count(String code, String needle) {
+  if (needle.isEmpty) return 0;
+  var c = 0;
+  var i = code.indexOf(needle);
+  while (i >= 0) {
+    c++;
+    i = code.indexOf(needle, i + needle.length);
+  }
+  return c;
+}
+
+/// 取 `marker` 所在方法/函数体的完整块（花括号配对）。
+String _blockAfter(String code, String marker) {
+  final i = code.indexOf(marker);
+  if (i < 0) return '';
+  final open = code.indexOf('{', i);
+  if (open < 0) return '';
+  var depth = 0;
+  for (var j = open; j < code.length; j++) {
+    final c = code[j];
+    if (c == '{') {
+      depth++;
+    } else if (c == '}') {
+      depth--;
+      if (depth == 0) return code.substring(i, j + 1);
+    }
+  }
+  return code.substring(i);
 }
 
 // ── 固定数据（合法 UUID 形状）───────────────────────────────────────────────
@@ -403,6 +451,130 @@ Future<void> main() async {
         g.remaining == g.receivable - g.received);
     final ws = await db.listWorkRecords(includeDraft: false);
     check('③ 明细金额均为 int', ws.every((w) => w.amountSnapshot is int));
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  print('== 10. UI 接线静态断言（读真实 lib/ui 源码 · 剥注释 · 精确锚定；堵审计 F1~F3 逃逸）==');
+  // ═══════════════════════════════════════════════════════════════
+  // 依据：`docs/08-验证脚本断言强度审计/03-verify_waveA 与 waveA2.md` §3.2/§4.1。
+  //   审计判定 §2「P-DEBT 欠款合计口径」等**只在测试里现算**，不验证页面接线；
+  //   本段补「读真实页面源码、剥注释、切方法体、对实参精确锚定」的静态断言。
+  //   目标逃逸点：F1a/F1b（P-DEBT 页面口径）、F2a/F2b（下钻 filter 实参）、
+  //   F3a/F3b/F3c（P01/P-DEBT/P06 裸调 listCompanies）。
+  {
+    final ovw = _stripComments(_read('lib/ui/overview_page.dart'));
+    final debtSrc = _stripComments(_read('lib/ui/debt_list_page.dart'));
+    final cdp = _stripComments(_read('lib/ui/company_detail_page.dart'));
+    final compSrc = _stripComments(_read('lib/ui/company_page.dart'));
+    const doubleTrue =
+        'listCompanies(includeDisabled: true, includeDeleted: true)';
+
+    // ── F1a/F1b：P-DEBT 页面「欠款合计」口径（切片 _load 方法体）────────────
+    final debtLoad = _blockAfter(debtSrc, 'Future<void> _load()');
+    check(
+      '⑩① P-DEBT 行集仅取 remaining > 0（切片 _load 内 `if (a.remaining > 0)` 恰 1、无 `!= 0`）[堵 F1a]',
+      _count(debtLoad, 'if (a.remaining > 0)') == 1 &&
+          _count(debtLoad, 'if (a.remaining != 0)') == 0,
+      'if(>0)=${_count(debtLoad, 'if (a.remaining > 0)')} '
+          'if(!=0)=${_count(debtLoad, 'if (a.remaining != 0)')}',
+    );
+    check(
+      '⑩② P-DEBT 欠款合计公式 == `s + r.agg.remaining`（切片 _load 内恰 1，非取反）[堵 F1b]',
+      _count(debtLoad, 's + r.agg.remaining') == 1 &&
+          _count(debtLoad, 's + (-r.agg.remaining)') == 1,
+      'debt=${_count(debtLoad, 's + r.agg.remaining')}(期望1) '
+          'overpaid=${_count(debtLoad, 's + (-r.agg.remaining)')}(期望1)',
+    );
+    check(
+      '⑩③ P-DEBT 页面显式标注口径（`欠款合计` 文案 + `欠款合计 ≠ 看板「剩余工资」`）[AC-PDBT-05]',
+      debtSrc.contains('欠款合计') &&
+          debtSrc.contains('欠款合计 ≠ 看板「剩余工资」'),
+      '含欠款合计=${debtSrc.contains('欠款合计')} '
+          '含口径标注=${debtSrc.contains('欠款合计 ≠ 看板「剩余工资」')}',
+    );
+
+    // ── F2a/F2b：下钻 filter 实参（切片各方法体）──────────────────────────
+    final recvBody = _blockAfter(ovw, 'Future<void> _openReceivableDrill()');
+    check(
+      '⑩④ P01 应收下钻实参 == RecordsFilter.receivableDrill（切片内，无 .all）[堵 F2a]',
+      _count(recvBody, 'filter: RecordsFilter.receivableDrill') == 1 &&
+          !recvBody.contains('RecordsFilter.all'),
+      '命中=${_count(recvBody, 'filter: RecordsFilter.receivableDrill')} '
+          '含.all=${recvBody.contains('RecordsFilter.all')}',
+    );
+    final rcvdBody = _blockAfter(ovw, 'Future<void> _openReceivedDrill()');
+    check(
+      '⑩⑤ P01 已收下钻实参 == RecordsFilter.receivedDrill（切片内）[AC-P01-05]',
+      _count(rcvdBody, 'filter: RecordsFilter.receivedDrill') == 1 &&
+          !rcvdBody.contains('RecordsFilter.receivableDrill'),
+      '命中=${_count(rcvdBody, 'filter: RecordsFilter.receivedDrill')}',
+    );
+    final workListBody = _blockAfter(cdp, 'Widget _buildWorkList()');
+    check(
+      '⑩⑥ P07 工作 tab 实参 == RecordsFilter.companyWork(widget.companyId)（切片内）[堵 F2b]',
+      _count(workListBody, 'filter: RecordsFilter.companyWork(widget.companyId)') ==
+              1 &&
+          !workListBody.contains('RecordsFilter.receivableDrill'),
+      '命中=${_count(workListBody, 'filter: RecordsFilter.companyWork(widget.companyId)')} '
+          '含receivableDrill=${workListBody.contains('RecordsFilter.receivableDrill')}',
+    );
+    final payListBody = _blockAfter(cdp, 'Widget _buildPaymentList()');
+    check(
+      '⑩⑦ P07 收款 tab 实参 == RecordsFilter.companyPayment(widget.companyId)（切片内）[AC-P07-11]',
+      _count(payListBody, 'filter: RecordsFilter.companyPayment(widget.companyId)') == 1,
+      '命中=${_count(payListBody, 'filter: RecordsFilter.companyPayment(widget.companyId)')}',
+    );
+
+    // ── F3a/F3b/F3c：三页公司元数据禁裸调（精确计数，剥离注释）─────────────
+    check(
+      '⑩⑧ P01 公司元数据双 true 恰 1、裸调 listCompanies() 恰 0 [堵 F3a / AC-P01-07]',
+      _count(ovw, doubleTrue) == 1 && _count(ovw, 'listCompanies()') == 0,
+      '双true=${_count(ovw, doubleTrue)} 裸调=${_count(ovw, 'listCompanies()')}',
+    );
+    check(
+      '⑩⑨ P-DEBT 公司元数据双 true 恰 1、裸调 listCompanies() 恰 0 [堵 F3b / AC-PDBT-03]',
+      _count(debtSrc, doubleTrue) == 1 && _count(debtSrc, 'listCompanies()') == 0,
+      '双true=${_count(debtSrc, doubleTrue)} 裸调=${_count(debtSrc, 'listCompanies()')}',
+    );
+    check(
+      '⑩⑩ P06 公司元数据双 true 恰 1、裸调 listCompanies() 恰 0 [堵 F3c / AC-P06-03]',
+      _count(compSrc, doubleTrue) == 1 && _count(compSrc, 'listCompanies()') == 0,
+      '双true=${_count(compSrc, doubleTrue)} 裸调=${_count(compSrc, 'listCompanies()')}',
+    );
+
+    // ── U-4 下钻接线（点卡片 → P07 / 剩余工资 → P-DEBT / 按钮接线）──────────
+    final openCompBody = _blockAfter(ovw, 'Future<void> _openCompanyDetail(Company c)');
+    check(
+      '⑩⑪ P01 点公司卡片 → CompanyDetailPage(companyId: c.id)（切片内）[AC-P01-06]',
+      _count(openCompBody, 'CompanyDetailPage(companyId: c.id)') == 1 &&
+          !openCompBody.contains('CompanyDebtListPage()'),
+      '命中=${_count(openCompBody, 'CompanyDetailPage(companyId: c.id)')}',
+    );
+    final openDebtBody = _blockAfter(ovw, 'Future<void> _openDebtList()');
+    check(
+      '⑩⑫ P01 剩余工资 → const CompanyDebtListPage()（切片内）[AC-P01-03]',
+      _count(openDebtBody, 'const CompanyDebtListPage()') == 1,
+      '命中=${_count(openDebtBody, 'const CompanyDebtListPage()')}',
+    );
+    check(
+      '⑩⑬ P01 下钻按钮接线：onReceivableTap/_openReceivableDrill、onReceivedTap/_openReceivedDrill 各恰 1 [AC-P01-04/05]',
+      _count(ovw, 'onReceivableTap: _openReceivableDrill') == 1 &&
+          _count(ovw, 'onReceivedTap: _openReceivedDrill') == 1,
+      '应收=${_count(ovw, 'onReceivableTap: _openReceivableDrill')} '
+          '已收=${_count(ovw, 'onReceivedTap: _openReceivedDrill')}',
+    );
+    check(
+      '⑩⑭ P01 公司卡片区接线：onCompanyTap/_openCompanyDetail、onAllCompaniesTap/_openAllCompanies 各恰 1 [AC-P01-06/08]',
+      _count(ovw, 'onCompanyTap: _openCompanyDetail') == 1 &&
+          _count(ovw, 'onAllCompaniesTap: _openAllCompanies') == 1,
+      '卡片=${_count(ovw, 'onCompanyTap: _openCompanyDetail')} '
+          '全部公司=${_count(ovw, 'onAllCompaniesTap: _openAllCompanies')}',
+    );
+    check(
+      '⑩⑮ AC-P01-07 空态判据用含停用/归档全集（`_companies.isEmpty` 恰 1）',
+      _count(ovw, '_companies.isEmpty') == 1,
+      '命中=${_count(ovw, '_companies.isEmpty')}',
+    );
   }
 
   print('');

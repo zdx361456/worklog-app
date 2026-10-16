@@ -19,12 +19,24 @@
 ///     三元式由 **`D1B-4b` 据源码精确断言**（review-d1b MAJ-2）。
 ///   · B10 **端到端（弹层同款输入：hourly `manualHours` + 真实 `resolveDayContext`）**：
 ///     标记节假日日 `96000`（3.0×）；未标记日 `32000`（1.0×）（**反证：两次必不同**）。
+///   · B11 **`listWorkRecords()` 排序口径**：归日最新在首（底层 `ORDER BY … DESC`）—— 堵审计 F7。
+///   · B12 **`pricing_bootstrap.ensureRule` 行为**：同 `(company,method,baseRate,unit)` 复用、
+///     `unit` 不同则新建 —— 即 `A10a`（sha256 / E 类）的**行为对应物**。
 ///
 /// 【实测级 / 强证据】§A（静态层，`A1~A12` + 下批 `D1B-1~8`）：`File.readAsStringSync` 读 **真实源码**
 ///   （非复刻、非转述），剥离注释后正则断言（剥离：`(^|\s)//.*$`，multiLine；**整行 + 行尾都剥**）。
 ///   `D1B-*` 覆盖：弹层形态（`showModalBottomSheet`）/ ★ `resolveDayContext` + `isWeekend:`/`isHoliday:`
 ///   取值 / 默认值取自 `listWorkRecords()` 首条 / 草稿分支文案 / P08 名称内联红字+置灰 / `contact`
 ///   不被 `showEnabled` 门控 / `ledgerId` 无 `?? ''` / 12 色调色板 + 已用色轮转。
+///
+/// **加固（2026-10-17 · 审计 04 假覆盖修复）**：静态层统一改为「**剥注释 + 切片到调用点看实参 +
+///   精确计数/精确期望值**」，堵住审计实测的假覆盖：`A1c`（写库双分支路由顺序，F5）、
+///   `A2b`（三档倍率字段↔输入框映射，F6）、`A6f`/`D1B-2d`（`resolveDayContext` 日期来源，F8）、
+///   `D1B-3b2`（`database.dart` 排序口径恰含 `DESC`，F7）、`D1B-7`（`?? ''` 单/双引号变体，F9）；
+///   `A11` 由「读原始字节 contains」改为「剥注释 + 正则容错」（消除**过敏感**误红，兼堵格式化逃逸）。
+///   并新增行为层 `B11`（`listWorkRecords()` 排序口径）/ `B12`（`pricing_bootstrap.ensureRule`
+///   复用判据含 `unit`）—— 其中 `B12` 即 `A10a`（sha256）的**行为对应物**：`A10a` 如实降级标注为
+///   **【E 类：仅防静默改动，不证明实现正确】**，`bootstrap` 行为正确性由 `B12` 覆盖。
 ///
 /// 【同构复刻 / 弱证据】B6 的「仿 `work_form_page._buildInput` 构造 `AmountInput`」：
 ///   `_buildInput` 是 `lib/ui/*` 的**私有**成员，脚本**拿不到**。此处**逐字段复刻**其 daily 分支的
@@ -69,6 +81,7 @@ import '../lib/models/types.dart';
 import '../lib/models/work_record.dart';
 import '../lib/services/amount_engine.dart';
 import '../lib/services/day_context.dart';
+import '../lib/services/pricing_bootstrap.dart';
 
 int _pass = 0;
 int _fail = 0;
@@ -116,8 +129,54 @@ String _read(String relPath) {
 }
 
 final RegExp _commentRe = RegExp(r'(^|\s)//.*$', multiLine: true);
+final RegExp _blockCommentRe = RegExp(r'/\*.*?\*/', dotAll: true);
 
-String _stripComments(String src) => src.replaceAll(_commentRe, '');
+/// 剥行注释 + 块注释。**所有** `contains`/正则断言应作用于其返回值（防注释救活）。
+String _stripComments(String src) =>
+    src.replaceAll(_blockCommentRe, '').replaceAll(_commentRe, '');
+
+/// `needle` 在 `code` 中的非重叠出现次数（精确计数，防「存在 ≥1 处即绿」）。
+int _count(String code, String needle) {
+  if (needle.isEmpty) return 0;
+  var c = 0;
+  var i = code.indexOf(needle);
+  while (i >= 0) {
+    c++;
+    i = code.indexOf(needle, i + needle.length);
+  }
+  return c;
+}
+
+/// 正则命中处数。
+int _reCount(String code, RegExp re) => re.allMatches(code).length;
+
+/// 取 `marker` 之后**第一个** `(` 到配对 `)` 的完整表达式（含 `marker`），
+/// 用于把断言锚定到某个调用点的**实参**（如 `_db.listCompanies(...)`）。
+String _parenAfter(String code, String marker) {
+  final i = code.indexOf(marker);
+  if (i < 0) return '';
+  final open = code.indexOf('(', i);
+  if (open < 0) return '';
+  var depth = 0;
+  for (var j = open; j < code.length; j++) {
+    final c = code[j];
+    if (c == '(') {
+      depth++;
+    } else if (c == ')') {
+      depth--;
+      if (depth == 0) return code.substring(i, j + 1);
+    }
+  }
+  return code.substring(i);
+}
+
+/// 取 [from] 到 [to] 之间的源码切片（把断言锚定到单个方法体）。
+String _slice(String code, String from, String to) {
+  final i = code.indexOf(from);
+  if (i < 0) return '';
+  final j = code.indexOf(to, i + from.length);
+  return j < 0 ? code.substring(i) : code.substring(i, j);
+}
 
 /// 逐处提取 `<key>\s*:\s*([^,\n]+)` 的**实际取值**（已去首尾空白）。
 /// 用于「单点逃逸」防线：`contains` 只看"存在 ≥1 处正确"，`count` 只看键出现次数，
@@ -459,6 +518,53 @@ Future<void> _behaviorLayer(AppDatabase db) async {
   _check(qResH.amount != qResP.amount,
       'B10c **反证**：同一规则、两日金额必须不同（链路真接通，非恒真）',
       '两者皆为 ${qResH.amount}');
+
+  // ── B11：listWorkRecords() 排序口径（归日 DESC → 「最近一条」在首）──────────
+  //   审计 F7 / D1B-3b：`database.dart:1272` 的 `attribution_date DESC, created_at DESC`
+  //   若被改为 ASC，「最近一条」变「最早一条」（弹层默认值取错），原两脚本皆 0 红。
+  print('\n[B11] listWorkRecords() 排序口径（归日 DESC；防 database.dart DESC→ASC 反转）');
+  WorkRecord orderRec(String id, DateTime date) => WorkRecord(
+        id: id,
+        workDate: date,
+        companyId: _cid,
+        pricingRuleId: 'ruleQ',
+        methodSnapshot: PricingMethod.hourly,
+        qtySnapshot: 1,
+        qtyUnitSnapshot: '小时',
+        rateSnapshot: 4000,
+        rateDetailSnapshot: const RateSnapshot(appliedRate: 10),
+        amountSnapshot: 4000,
+        amountSource: AmountSource.auto,
+        status: RecordStatus.confirmed,
+        createdAt: _t0,
+        updatedAt: _t0,
+      );
+  await db.upsertWorkRecord(orderRec('wOrderOld', DateTime(2026, 9, 1)));
+  await db.upsertWorkRecord(orderRec('wOrderNew', DateTime(2026, 12, 1)));
+  final ordered = await db.listWorkRecords();
+  _check(ordered.isNotEmpty && ordered.first.id == 'wOrderNew',
+      'B11a listWorkRecords() 首条 = 归日最新（wOrderNew @2026-12-01）—— 证明底层 ORDER BY 归日 DESC',
+      '首条=${ordered.isEmpty ? "空" : "${ordered.first.id}@${ordered.first.workDate}"}');
+  _check(ordered.length >= 2 && ordered.last.id == 'wOrderOld',
+      'B11b **反证**：末条 = 归日最早（wOrderOld @2026-09-01）—— DESC 反转即红，非恒真',
+      '末条=${ordered.isEmpty ? "-" : "${ordered.last.id}@${ordered.last.workDate}"}');
+
+  // ── B12：pricing_bootstrap.ensureRule 行为（A10a 哈希断言的行为对应物）──────
+  //   审计 §4.1：A10a 是 sha256 看门狗（E 类），其"全绿"只证「文件未被触碰」，不证行为正确，
+  //   且 bootstrap 行为在本脚本内零覆盖。本条**真调 `ensureRule`** 补上行为证据。
+  print('\n[B12] pricing_bootstrap.ensureRule 行为（复用判据含 unit；防 `&& r.unit == unit`→`&& true`）');
+  final eRule1 = await ensureRule(
+      companyId: _cid, method: PricingMethod.hourly, baseRate: 8888, unit: '小时');
+  final eRule2 = await ensureRule(
+      companyId: _cid, method: PricingMethod.hourly, baseRate: 8888, unit: '小时');
+  final eRule3 = await ensureRule(
+      companyId: _cid, method: PricingMethod.hourly, baseRate: 8888, unit: '天');
+  _check(eRule1.id == eRule2.id,
+      'B12a 同 (company,method,baseRate,unit) 二次调用 → 复用同一规则 id（幂等，AC-P09 规则复用）',
+      'e1=${eRule1.id} e2=${eRule2.id}');
+  _check(eRule3.id != eRule1.id,
+      'B12b **反证**：unit 不同 → 必须**新建**（不复用）—— 防 ensureRule 判据 `&& r.unit == unit` 被改为 `&& true`',
+      'e1=${eRule1.id} e3=${eRule3.id}（期望不等）');
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -493,6 +599,18 @@ void _staticLayer() {
         if (!ruleEdit.contains('updatePricingRule(')) 'updatePricingRule(',
         if (!ruleEdit.contains('softDeletePricingRule(')) 'softDeletePricingRule(',
       ].join(",")}');
+  // A1c ★ **加固（审计 F5 / 缺口 G-1）**：A1b 只断言「三个方法名各出现 ≥1 次」，
+  //   不验证**分支路由** ⇒ 把 `rule_edit_page.dart:221-225` 的 `updatePricingRule` /
+  //   `upsertPricingRule` 对调（编辑走插入、新建走按 id 更新 → 新建永远失败）仍 65/0。
+  //   现**精确锚定 `_isEdit` 双分支的路由顺序**（剥注释 + 正则 `\s*` 容错换行）。
+  final a1cFwd = RegExp(r'if\s*\(\s*_isEdit\s*\)\s*\{\s*await\s+_db\.updatePricingRule\(rule\)\s*;'
+      r'\s*\}\s*else\s*\{\s*await\s+_db\.upsertPricingRule\(rule\)\s*;');
+  final a1cRev = RegExp(r'if\s*\(\s*_isEdit\s*\)\s*\{\s*await\s+_db\.upsertPricingRule\(rule\)\s*;'
+      r'\s*\}\s*else\s*\{\s*await\s+_db\.updatePricingRule\(rule\)\s*;');
+  _check(a1cFwd.hasMatch(ruleEdit) && !a1cRev.hasMatch(ruleEdit),
+      'A1c ★ 写库双分支路由**顺序精确**：`if (_isEdit) { …updatePricingRule(rule) } else { …upsertPricingRule(rule) }`'
+      '（编辑走复用原 id、新建走插入；防两分支对调 —— 审计 F5）',
+      '正序命中=${a1cFwd.hasMatch(ruleEdit)} 反序命中=${a1cRev.hasMatch(ruleEdit)}');
 
   // A2：三档倍率**赋值**（构造器命名参数，带冒号 → 写而非读）
   _check(ruleEdit.contains('holidayRate:') &&
@@ -504,6 +622,23 @@ void _staticLayer() {
         if (!ruleEdit.contains('weekendRate:')) 'weekendRate:',
         if (!ruleEdit.contains('overtimeRate:')) 'overtimeRate:',
       ].join(",")}');
+  // A2b ★ **加固（审计 F6 / 缺口 G-2）**：A2 只断言三档倍率**字段名**出现，
+  //   不验证每个字段读到**哪个控制器** ⇒ 把 `rule_edit_page.dart:349` 的 `_wkCtrl.text`
+  //   改成 `_hdCtrl.text`（周末倍率被「节假日倍率」输入框静默覆盖）仍 65/0。
+  //   现**逐字段精确锚定取值来源**（各恰 1 处）。
+  final a2Ot = _extractValues(ruleEdit, 'overtimeRate');
+  final a2Wk = _extractValues(ruleEdit, 'weekendRate');
+  final a2Hd = _extractValues(ruleEdit, 'holidayRate');
+  _check(
+      a2Ot.length == 1 &&
+          a2Ot.single == '_parseRateX10(_otCtrl.text) ?? 15' &&
+          a2Wk.length == 1 &&
+          a2Wk.single == '_parseRateX10(_wkCtrl.text) ?? 10' &&
+          a2Hd.length == 1 &&
+          a2Hd.single == '_parseRateX10(_hdCtrl.text) ?? 10',
+      'A2b ★ 三档倍率**字段↔输入框映射逐处精确**：overtimeRate←_otCtrl / weekendRate←_wkCtrl / '
+      'holidayRate←_hdCtrl（各恰 1 处；防串线 —— 审计 F6 / AC-P09-02）',
+      'ot=$a2Ot wk=$a2Wk hd=$a2Hd');
 
   // A3：倍率口径说明固定文案
   _check(ruleEdit.contains('取最高档，不叠加'),
@@ -538,6 +673,14 @@ void _staticLayer() {
   _check(wHd.length == 4 && wHdBad.isEmpty,
       'A6e ★ work_form_page isHoliday: **逐处** == _dayCtx.isHoliday（恰 4 处）',
       '处数=${wHd.length}（期望 4）越界取值=$wHdBad 全量=$wHd');
+  // A6f ★ **加固（审计 F8 / 缺口 G-3）**：A6d/A6e 只校验 isWeekend/isHoliday 的**取值表达式**，
+  //   不校验 `resolveDayContext` 的**日期来源** ⇒ 把日期改成 `DateTime.now()` 仍绿（弹层同构点实测 F8）。
+  //   现锚定 `work_form_page` 的 `resolveDayContext(...)` 实参 `workDate: _workDate`。
+  final wfCtxCall = _parenAfter(workForm, 'resolveDayContext(');
+  _check(wfCtxCall.contains('workDate: _workDate') && !wfCtxCall.contains('DateTime.now()'),
+      'A6f ★ work_form_page `resolveDayContext(...)` 实参 `workDate: _workDate`'
+      '（周末/节假日上下文按**本条记录日期**判定，审计 F8/G-3）',
+      '实参=${wfCtxCall.replaceAll(RegExp(r"\s+"), " ")}');
   _check(workForm.contains('holidayRate:'),
       'A6c work_form_page 含 holidayRate:（预览规则 D1-b，闭合 B2）', '未找到 holidayRate:');
 
@@ -585,7 +728,8 @@ void _staticLayer() {
   _check(bootstrapRaw.isNotEmpty, 'A10 前置：pricing_bootstrap.dart 可读', '文件缺失/空');
   final sha = sha256.convert(File('lib/services/pricing_bootstrap.dart').readAsBytesSync()).toString();
   _check(sha == _pricingBootstrapSha,
-      'A10a pricing_bootstrap.dart sha256 == 冻结基线（**逐字节相同**，D1-d 定案 A）',
+      'A10a pricing_bootstrap.dart sha256 == 冻结基线（**逐字节相同**，D1-d 定案 A）'
+      '｜**【E 类：仅防静默改动，不证明实现正确】**（加注释/格式化亦同红；行为正确性见 B12）',
       '实际 $sha\n           期望 $_pricingBootstrapSha');
   // A10b：**环境项（不计入产品断言）**。原 A10b 断言 mtime 早于冻结时刻 ⇒ 任何复制/检出/
   //   打补丁（未 `cp -p`）都会重置 mtime 而**误红**，测的不是代码不变量（review-d1b MIN-1）。
@@ -594,11 +738,14 @@ void _staticLayer() {
   print('  · A10b [环境项·不计入通过数] pricing_bootstrap mtime=$mt'
       '（早于冻结 $_freeze = ${mt.isBefore(_freeze)}）；「未改」证据以 A10a sha256 为准');
 
-  // A11：不复活死路由
-  _check(!_fileTreeContains('lib', 'pushNamed(Routes.records)') &&
-          !_fileTreeContains('lib', 'pushNamed(Routes.overview)'),
-      'A11 lib/ 内 pushNamed(Routes.records) / pushNamed(Routes.overview) **0 命中**',
-      '命中死路由');
+  // A11：不复活死路由（**剥注释** + 正则容错空白 —— 审计 §4.2）
+  //   旧版 `_fileTreeContains` 读**原始字节** `contains(needle)`：① 注释里出现该字串即误红
+  //   （过敏感，实测仅加一句注释即 64/1）；② 真实死路由若被格式化（`pushNamed( Routes.records )`）
+  //   则逃逸。现改为剥注释 + `\s*` 容错正则，兼顾降误报与堵格式化逃逸。
+  final a11Hits = _fileTreeHits('lib', RegExp(r'pushNamed\(\s*Routes\.(records|overview)\s*[,)]'));
+  _check(a11Hits.isEmpty,
+      'A11 lib/ 剥注释后 `pushNamed( Routes.records|overview )` **0 命中**（防死路由复活；过敏感已收紧）',
+      '命中：$a11Hits');
 
   // A12：陈旧注释订正（R61）
   _check(!workForm.contains('基础版没有「规则管理」页'),
@@ -634,6 +781,15 @@ void _staticLayer() {
   _check(qHd.length == 3 && qHdBad.isEmpty,
       'D1B-2c ★ 弹层 isHoliday: **逐处** == ctx.isHoliday（恰 3 处，3 个 method 分支各一）',
       '处数=${qHd.length}（期望 3）越界取值=$qHdBad 全量=$qHd');
+  // D1B-2d ★ **加固（审计 F8 / 缺口 G-3）**：D1B-2b/2c 只校验**取值表达式** `ctx.isWeekend`/
+  //   `ctx.isHoliday`，不校验 **ctx 由哪个日期算出** ⇒ 把 `quick_add_sheet.dart:172` 的
+  //   `workDate: _workDate` 改成 `DateTime.now()`（按“今天”判周末/节假日）仍 65/0。
+  //   现锚定 `resolveDayContext(...)` 实参 `workDate: _workDate`。
+  final qaCtxCall = _parenAfter(quickAdd, 'resolveDayContext(');
+  _check(qaCtxCall.contains('workDate: _workDate') && !qaCtxCall.contains('DateTime.now()'),
+      'D1B-2d ★ 弹层 `resolveDayContext(...)` 实参 `workDate: _workDate`'
+      '（上下文按**本条记录日期**判定，非“今天”；审计 F8/G-3）',
+      '实参=${qaCtxCall.replaceAll(RegExp(r"\s+"), " ")}');
 
   // D1B-3：默认值派生自 listWorkRecords() 首条（companyId/pricingRuleId/qtySnapshot）
   _check(quickAdd.contains('listWorkRecords()'),
@@ -641,6 +797,17 @@ void _staticLayer() {
   _check(quickAdd.contains('recent.first'),
       'D1B-3b 取 `recent.first`（首条 = ORDER BY attribution_date DESC, created_at DESC 最近一条）',
       '未找到 recent.first');
+  // D1B-3b2 ★ **加固（审计 F7 / 缺口 G-4）**：D1B-3b 只断言源码含 `recent.first` 字面量，
+  //   **不验证底层排序** ⇒ 把 `database.dart:1272` 的 `attribution_date DESC, created_at DESC`
+  //   改成 ASC（「最近一条」变「最早一条」、弹层默认值取错）仍 65/0（waveB 亦然）。
+  //   现**精确锚定该 SQL 片段恰含 DESC 且无 ASC**（另由 B11 以真实 DB 行为断言同口径）。
+  final dbCode = _stripComments(_read('lib/db/database.dart'));
+  final descN = _count(dbCode, 'attribution_date DESC, created_at DESC');
+  final ascN = _count(dbCode, 'attribution_date ASC');
+  _check(descN == 1 && ascN == 0,
+      'D1B-3b2 ★ `database.dart` 恰一处 `attribution_date DESC, created_at DESC`'
+      '（`_workRecordRows` 排序口径 →「最近一条」= 首条；防 DESC→ASC 反转 —— 行为侧见 B11）',
+      'DESC 片段数=$descN（期望 1） ASC 片段数=$ascN（期望 0）');
   _check(quickAdd.contains('last?.companyId') &&
           quickAdd.contains('last?.pricingRuleId') &&
           quickAdd.contains('last?.qtySnapshot'),
@@ -696,10 +863,15 @@ void _staticLayer() {
       'D1B-6 联系方式字段在 build 中**先于** if(widget.showEnabled)（新建态可渲染，AC-P08-05）',
       'iContact=$iContact iShowEnabled=$iShowEnabled（须 0<=iContact<iShowEnabled）');
 
-  // D1B-7：ledgerId 的 ?? '' 兜底消失
-  _check(!companyPage.contains("AppState.ledgerId ?? ''"),
-      'D1B-7 ledgerId 的 ?? \'\' 兜底已消失（AC-P08-09：改显式失败）',
-      '仍命中 AppState.ledgerId ?? \'\'');
+  // D1B-7 ★ **加固（审计 F9）**：旧式只匹配**单引号**字面量 `AppState.ledgerId ?? ''`
+  //   ⇒ 双引号变体 `?? ""`（`company_page.dart:174`）逃逸，且紧随的 `if (ledgerId == null)`
+  //   沦为死代码（空账本 id 被写进新建公司，违反 AC-P08-09）。现改为**正则禁 `??` 兜底**
+  //   （单/双引号变体皆命中），并断言「无账本 → 显式失败」守卫仍在。
+  final ledgerCoalesce = RegExp(r'AppState\.ledgerId\s*\?\?');
+  final ledgerGuard = RegExp(r'if\s*\(\s*ledgerId\s*==\s*null\s*\)\s*\{');
+  _check(!ledgerCoalesce.hasMatch(companyPage) && ledgerGuard.hasMatch(companyPage),
+      'D1B-7 ledgerId **无 `??` 兜底**（单/双引号变体皆禁）且保留「无账本 → 显式失败」守卫（AC-P08-09）',
+      '命中 ??=${ledgerCoalesce.hasMatch(companyPage)} 守卫="${ledgerGuard.hasMatch(companyPage)}"');
 
   // D1B-8：12 色调色板 + 已用色轮转
   final palMatch =
@@ -714,21 +886,23 @@ void _staticLayer() {
       'used轮转=${companyPage.contains('!used.contains(')} / length%=${companyPage.contains('_companies.length %')}');
 }
 
-/// 在 `dir` 下递归查 `needle`（读真实源码，用于 A11 全 lib 扫描）。
-bool _fileTreeContains(String dir, String needle) {
+/// 在 `dir` 下递归查 `re`（**剥注释后**匹配），返回命中文件清单（用于 A11 全 lib 扫描）。
+/// **加固（审计 §4.2）**：旧版 `_fileTreeContains` 读**原始字节** `contains(needle)` ⇒
+/// ① 注释/文档里出现该字串即误红（过敏感）；② 真实死路由若被格式化或用变量中转则逃逸。
+/// 现改为「剥注释 + 正则 `\s*` 容错」，兼顾降低误报与堵格式化逃逸。
+List<String> _fileTreeHits(String dir, RegExp re, {Set<String> exclude = const {}}) {
+  final out = <String>[];
   final d = Directory(dir);
-  if (!d.existsSync()) return false;
+  if (!d.existsSync()) return out;
   for (final e in d.listSync(recursive: true, followLinks: false)) {
     if (e is! File) continue;
     if (!e.path.endsWith('.dart')) continue;
+    if (exclude.contains(e.path.replaceAll(r'\', '/'))) continue;
     try {
-      if (e.readAsStringSync().contains(needle)) {
-        print('    · A11 命中：${e.path}');
-        return true;
-      }
+      if (re.hasMatch(_stripComments(e.readAsStringSync()))) out.add(e.path);
     } catch (_) {
       // 跳过不可读文件
     }
   }
-  return false;
+  return out;
 }

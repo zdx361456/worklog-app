@@ -13,6 +13,13 @@
 //   【不覆盖】 `AC-A2-01` / `AC-A2-02` / `AC-A2-04` 为 **[真机]** 档（Tab 可点入、
 //             占位页非空白、切换不崩）→ 本脚本**不能**替代，须末次出包真机验收。
 //
+// 断言强度加固（依据 `docs/08-验证脚本断言强度审计/03-verify_waveA 与 waveA2.md` §3.2）：
+//   · [4] 可达性：由「全文出现/计数 ≥1」改为**实参级锚定方法体 + 剥注释 + 精确计数**——
+//     `_openAllRecords` 内 RecordsPage( 恰 1、`_openCompanyDetail` 内 CompanyDetailPage 接线（堵 F4）、
+//     `pushNamed(Routes.companies)` 剥注释后恰 2 且 `_openAllCompanies` 内恰 1（堵 F5；注释行不再计入）。
+//   · [5] 文案：AppBar 标题**锚定 `appBar:` 表达式内 `title:`**（堵 F6 单点逃逸）；
+//     「总览」字面量扫描范围由 `lib/ui` 扩至**整个 `lib`** 且**单/双引号均查**（堵 F7）。
+//
 // 跑法：`export WORKLOG_USE_SYSTEM_SQLITE=1; dart --disable-dart-dev tool/verify_waveA2.dart`
 //      （本脚本用 dart:io，不触 DB；WORKLOG_USE_SYSTEM_SQLITE 仅为与其他套件保持一致的跑法）
 //
@@ -59,6 +66,62 @@ List<String> _stringLiteralsAfter(String src, String key) {
     out.add(m.group(1)!);
   }
   return out;
+}
+
+// ── 静态锚定工具（[4]/[5] 加固用；手法同唯一 0 假覆盖脚本 `verify_waveD2.dart:98-227`）──
+/// 剥离**整行注释 + 行尾注释**（`(^|\s)//.*$`）。注释行不得救活断言（堵 F5）。
+final RegExp _commentRe = RegExp(r'(^|\s)//.*$', multiLine: true);
+String _stripComments(String src) => src.replaceAll(_commentRe, '');
+
+/// `needle` 在 `code` 中的**总出现次数**（不重叠）。
+int _count(String code, String needle) {
+  if (needle.isEmpty) return 0;
+  var c = 0;
+  var i = code.indexOf(needle);
+  while (i >= 0) {
+    c++;
+    i = code.indexOf(needle, i + needle.length);
+  }
+  return c;
+}
+
+/// 取 `marker` 所在方法/函数体的完整块（花括号配对）。
+String _blockAfter(String code, String marker) {
+  final i = code.indexOf(marker);
+  if (i < 0) return '';
+  final open = code.indexOf('{', i);
+  if (open < 0) return '';
+  var depth = 0;
+  for (var j = open; j < code.length; j++) {
+    final c = code[j];
+    if (c == '{') {
+      depth++;
+    } else if (c == '}') {
+      depth--;
+      if (depth == 0) return code.substring(i, j + 1);
+    }
+  }
+  return code.substring(i);
+}
+
+/// 取 `marker` 之后**第一个** `(` 到配对 `)` 的完整表达式（含 `marker`）。
+/// 用于无花括号体的块提取（如 `appBar: AppBar(title: …)`）。
+String _parenAfter(String code, String marker) {
+  final i = code.indexOf(marker);
+  if (i < 0) return '';
+  final open = code.indexOf('(', i);
+  if (open < 0) return '';
+  var depth = 0;
+  for (var j = open; j < code.length; j++) {
+    final c = code[j];
+    if (c == '(') {
+      depth++;
+    } else if (c == ')') {
+      depth--;
+      if (depth == 0) return code.substring(i, j + 1);
+    }
+  }
+  return code.substring(i);
 }
 
 void main() {
@@ -183,9 +246,9 @@ void main() {
   stdout.writeln('\n[4] 原 Tab 页降级为下钻页后仍可达（AC-A2-04 / Q22）');
   final routeSrc = _read('lib/app/routes.dart');
   _check(
-    routeSrc.contains('companies'),
-    'Routes.companies 保留为活路由（M-2 裁定，A2 不得清理）',
-    'routes.dart 中 companies 路由被删',
+    routeSrc.contains("static const String companies = '/companies';"),
+    'Routes.companies 保留为活路由且值不改为 /companies（M-2 裁定，A2 不得清理）',
+    'routes.dart 中 companies 路由被删或被改',
   );
   _check(
     mainSrc.contains('case Routes.companies:') &&
@@ -194,45 +257,67 @@ void main() {
     'Routes.companies 未注册到 CompanyPage',
   );
   final overviewSrc = _read('lib/ui/overview_page.dart');
-  final recordsPushCount =
-      RegExp(r'RecordsPage\(').allMatches(overviewSrc).length;
+  // ★ 加固（审计 F4/F5）：实参级锚定 + 剥注释 + 精确计数，取代原「任意位置出现/计数 ≥1」。
+  final overviewCode = _stripComments(overviewSrc);
+  // ① P01 明细下钻入口：锚定「查看全部记录」→ _openAllRecords 方法体内 RecordsPage(
+  final allRecordsBody =
+      _blockAfter(overviewCode, 'Future<void> _openAllRecords()');
+  final recordsPushCount = _count(allRecordsBody, 'RecordsPage(');
   _check(
-    recordsPushCount >= 1,
-    'P01 仍有 RecordsPage 下钻入口（共 $recordsPushCount 处）',
-    'P01 内已无 RecordsPage 入口 → 明细页失去可达性',
+    recordsPushCount == 1,
+    'P01「查看全部记录」→ _openAllRecords 方法体内 RecordsPage( 恰 1（剥注释·锚定方法体）',
+    '实际 $recordsPushCount 处（期望 1）→ 明细页失去可达性',
   );
-  final companiesPushCount =
-      RegExp(r'pushNamed\(Routes\.companies\)').allMatches(overviewSrc).length;
+  // ② ★审计 F4 逃逸点：点公司卡片 → P07 公司详情（原 [4] 只数 RecordsPage(，未查该接线）
+  final openCompanyBody =
+      _blockAfter(overviewCode, 'Future<void> _openCompanyDetail(Company c)');
+  final companyDetailCount =
+      _count(openCompanyBody, 'CompanyDetailPage(companyId: c.id)');
   _check(
-    companiesPushCount >= 1,
-    'P01 仍有 pushNamed(Routes.companies) 入口（共 $companiesPushCount 处）',
-    'P01 内已无公司列表入口 → P06 失去可达性',
+    companyDetailCount == 1 && !openCompanyBody.contains('CompanyDebtListPage()'),
+    'P01 点公司卡片 → _openCompanyDetail 方法体内 CompanyDetailPage(companyId: c.id) 恰 1（堵 F4）',
+    '实际：CompanyDetailPage=$companyDetailCount 含CompanyDebtListPage=${openCompanyBody.contains('CompanyDebtListPage()')}',
+  );
+  // ③ ★审计 F5 逃逸点：M-2 一律 pushNamed；剥注释后精确计数（注释行不得计入）
+  final companiesPushCount =
+      _count(overviewCode, 'pushNamed(Routes.companies)');
+  final allCompaniesBody =
+      _blockAfter(overviewCode, 'Future<void> _openAllCompanies()');
+  final allCompaniesPush =
+      _count(allCompaniesBody, 'pushNamed(Routes.companies)');
+  _check(
+    companiesPushCount == 2 && allCompaniesPush == 1,
+    'P01 剥注释后 pushNamed(Routes.companies) 恰 2 处，且「全部公司」_openAllCompanies 内恰 1（M-2，堵 F5）',
+    '全文=$companiesPushCount（期望 2）_openAllCompanies 内=$allCompaniesPush（期望 1）',
   );
 
   // ── 5. 用户可见文案口径统一为「看板」（07 通篇无「总览」）──────────
   stdout.writeln('\n[5] 用户可见文案：总览 → 看板（07 通篇无「总览」）');
+  // ★ 加固（审计 F6）：锚定 appBar: 表达式内的 title:，取代「全文 contains Text('看板')」单点逃逸。
+  final appBarExpr = _parenAfter(overviewCode, 'appBar:');
   _check(
-    overviewSrc.contains("Text('看板')"),
-    'P01 AppBar 标题 = 看板',
-    'P01 AppBar 标题未改为看板',
+    appBarExpr.contains("title: const Text('看板')") &&
+        !appBarExpr.contains("Text('首页')"),
+    'P01 AppBar 标题 = 看板（锚定 appBar: 表达式内 title:，堵 F6 单点逃逸）',
+    'appBar 表达式=$appBarExpr',
   );
-  final uiDir = Directory('lib/ui');
   final offenders = <String>[];
-  final literalTotal = RegExp(r"'[^']*总览[^']*'");
+  // 单/双引号字符串字面量均查（堵 F7：`Text("总览")` 双引号诱饵）
+  final literalTotal = RegExp("['\"][^'\"\n]*总览[^'\"\n]*['\"]");
   // 剥离注释：**整行注释与行尾注释都要剥**（`(^|\s)//.*$`）。
   // ⚠️ 只剥整行注释会漏掉 `code(); // 说明` 这类行尾注释 → 制造**假阳性**
   //    （本项目真实教训：检查器粗糙时不得据此改本来无害的代码）。
-  final commentRe = RegExp(r'(^|\s)//.*$', multiLine: true);
-  for (final e in uiDir.listSync(recursive: true)) {
+  // ★ 加固（审计 F7）：扫描范围 = **整个 lib**（非仅 lib/ui），堵「lib/ui 之外的可见字面量」缺口。
+  for (final e in Directory('lib').listSync(recursive: true)) {
     if (e is! File || !e.path.endsWith('.dart')) continue;
-    final codeOnly = e.readAsStringSync().replaceAll(commentRe, '');
+    final codeOnly = e.readAsStringSync().replaceAll(_commentRe, '');
     if (literalTotal.hasMatch(codeOnly)) {
       offenders.add(e.path);
     }
   }
   _check(
     offenders.isEmpty,
-    'lib/ui 下无遗留的用户可见「总览」字面量',
+    'lib/（含 main.dart，非仅 lib/ui）下无遗留的用户可见「总览」字面量（单/双引号均查）',
     '仍命中：$offenders',
   );
 
@@ -278,7 +363,7 @@ void main() {
   final deadOffenders = <String>[];
   for (final e in Directory('lib').listSync(recursive: true)) {
     if (e is! File || !e.path.endsWith('.dart')) continue;
-    if (deadRef.hasMatch(e.readAsStringSync().replaceAll(commentRe, ''))) {
+    if (deadRef.hasMatch(e.readAsStringSync().replaceAll(_commentRe, ''))) {
       deadOffenders.add(e.path);
     }
   }
@@ -304,6 +389,7 @@ void main() {
     exit(1);
   }
   stdout.writeln('本脚本覆盖 [静态] 档：AC-A2-03 / AC-A2-05、文案口径（总览→看板）、'
-      '死路由清理（MAJ-01）与 RecordsPage.title 必填化。');
+      '死路由清理（MAJ-01）与 RecordsPage.title 必填化；'
+      '[4] 可达性已升级为实参级锚定（下钻接线 / pushNamed 精确计数）。');
   stdout.writeln('【未覆盖】AC-A2-01 / AC-A2-02 / AC-A2-04 属 [真机] 档，须末次出包人工验收。');
 }

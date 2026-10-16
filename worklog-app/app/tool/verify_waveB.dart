@@ -22,6 +22,11 @@
 ///             (a) **整行精确匹配**（强）：仅 `baseRate` 反推行、`_roundDiv` 公式行、C-01 草稿守卫行；
 ///             (b) **关键片段包含**（中）：如 `isOvertime: rd.overtime,`、可空字段显式传全；
 ///             (c) **存在性检查**（弱）：如 `contains('_db.softDeleteWorkRecord(')`。
+///             **加固（2026-10-17 · 审计 04 假覆盖修复）**：§5 全部断言一律作用于
+///             **剥注释后**的源码（`_stripComments`，行注释 + 块注释），并对关键项**切片到
+///             调用点看实参 / 精确计数**（⑩⑭⑮⑲）。理由：`calendar_page.dart:12/78/80` 等
+///             doc 注释含与代码相同的字面量，未剥注释时 `contains` 会被注释「救活」
+///             （审计 F1/F2/F3/F4 实测：改坏代码仍 76/0）。
 ///             ⇒ **不得**据此宣称「页面与脚本逐字一致」；**P05 重算类结论一律降级为【读码级】**。
 ///   【不覆盖 · [真机]】UI 渲染 / 手势 / 弹窗 / 高亮 / 虚线框 / 折叠交互——
 ///             本脚本**不能**替代，须末次出包真机验收（见 `13-WaveB-实现设计.md` §2）。
@@ -75,6 +80,68 @@ void check(String name, bool ok, [String? detail]) {
 String _read(String relPath) {
   final f = File(relPath);
   return f.existsSync() ? f.readAsStringSync() : '';
+}
+
+// ── 静态断言工具（读码级）────────────────────────────────────────────────────
+// 手法沿用本项目唯一「0 假覆盖」脚本 `tool/verify_waveD2.dart`：
+//   ① 剥注释后再断言（否则文档注释里出现过同一字面量会救活被改坏的代码 —— 审计 F1/F2 根因）；
+//   ② 切片到具体调用点看**实参**（否则「两处字面量对调 / 单点取值写反」逃逸 —— 审计 F4）；
+//   ③ 计数精确到确定期望（否则「存在 ≥1 处正确」即绿 —— 审计 F3）。
+final RegExp _commentRe = RegExp(r'(^|\s)//.*$', multiLine: true);
+final RegExp _blockCommentRe = RegExp(r'/\*.*?\*/', dotAll: true);
+
+/// 剥行注释 + 块注释。**所有** `contains`/正则断言必须作用于其返回值。
+String _stripComments(String src) =>
+    src.replaceAll(_blockCommentRe, '').replaceAll(_commentRe, '');
+
+/// `needle` 在 `code` 中的非重叠出现次数。
+int _count(String code, String needle) {
+  if (needle.isEmpty) return 0;
+  var c = 0;
+  var i = code.indexOf(needle);
+  while (i >= 0) {
+    c++;
+    i = code.indexOf(needle, i + needle.length);
+  }
+  return c;
+}
+
+/// 正则命中处数。
+int _reCount(String code, RegExp re) => re.allMatches(code).length;
+
+/// 逐处提取 `<key>\s*:\s*([^,\n]+)` 的**实际取值**（去首尾空白）。
+/// 用于「单点逃逸」防线：`contains` 只看「存在 ≥1 处正确」，抓不住「某一处取值写反」。
+List<String> _extractValues(String code, String key) {
+  final re = RegExp('$key\\s*:\\s*([^,\\n]+)');
+  return [for (final m in re.allMatches(code)) m.group(1)!.trim()];
+}
+
+/// 取 `marker` 之后**第一个** `(` 到配对 `)` 的完整表达式（含 `marker`）。
+/// 用于把断言锚定到某个调用点的**实参**。
+String _parenAfter(String code, String marker) {
+  final i = code.indexOf(marker);
+  if (i < 0) return '';
+  final open = code.indexOf('(', i);
+  if (open < 0) return '';
+  var depth = 0;
+  for (var j = open; j < code.length; j++) {
+    final c = code[j];
+    if (c == '(') {
+      depth++;
+    } else if (c == ')') {
+      depth--;
+      if (depth == 0) return code.substring(i, j + 1);
+    }
+  }
+  return code.substring(i);
+}
+
+/// 取 [from] 到 [to] 之间的源码切片（把断言锚定到单个 getter / 方法体）。
+String _slice(String code, String from, String to) {
+  final i = code.indexOf(from);
+  if (i < 0) return '';
+  final j = code.indexOf(to, i + from.length);
+  return j < 0 ? code.substring(i) : code.substring(i, j);
 }
 
 String _fmt(DateTime d) =>
@@ -195,6 +262,28 @@ Future<void> main() async {
       end: DateTime(2026, 11, 1, 12),
       autoReference: 123,
       createdAt: DateTime(2026, 11, 1, 9)));
+
+  // ═══════════════════════════════════════════════════════════════════════
+  print('== 1.5 整表排序口径（listWorkRecords() 归日 DESC → 「最近一条」在首）==');
+  // ═══════════════════════════════════════════════════════════════════════
+  {
+    // 审计 F7/D1B-3b：`database.dart:1272` 的 `attribution_date DESC, created_at DESC`
+    // 若被改为 ASC（「最近一条」变「最早一条」），原两脚本皆 0 红。
+    // 本段用真实 DB 回读兜住该口径 —— 行为级断言，与页面/弹层无关地证明底层排序。
+    final all = await db.listWorkRecords();
+    check(
+      '★1 整表排序：首条 = 归日最新（w6 @2026-11-01）—— 证明底层 ORDER BY 归日 DESC 生效',
+      all.isNotEmpty &&
+          all.first.id.endsWith('000006') &&
+          _fmt(all.first.workDate) == '2026-11-01',
+      '首条=${all.isEmpty ? "空" : "${all.first.id.substring(29)}@${_fmt(all.first.workDate)}"}',
+    );
+    check(
+      '★2 **反证**：末条归日 ≠ 首条归日（集合含多日，排序确有区分力，非恒真）',
+      all.length >= 2 && _fmt(all.last.workDate) != _fmt(all.first.workDate),
+      '首=${all.isEmpty ? "-" : _fmt(all.first.workDate)} 末=${all.isEmpty ? "-" : _fmt(all.last.workDate)}',
+    );
+  }
 
   // ═══════════════════════════════════════════════════════════════════════
   print('== 1. P03 日历日期口径（实测级：真实 DB）==');
@@ -629,6 +718,13 @@ Future<void> main() async {
     final p03 = _read('lib/ui/calendar_page.dart');
     final p04 = _read('lib/ui/day_detail_page.dart');
 
+    // **剥注释版本**：本段所有静态断言一律作用于剥注释后的源码。
+    // 根因（审计 F1/F2）：`calendar_page.dart:12`/`:78`/`:80` 的 doc 注释含与代码相同的
+    // 字面量，`contains` 在未剥注释时被注释救活 ⇒ 改坏代码仍绿。
+    final p05Code = _stripComments(p05);
+    final p03Code = _stripComments(p03);
+    final p04Code = _stripComments(p04);
+
     // P05：完整调用链（拆签名两组 + 事务变体 + 可空字段显式传全）。
     check('① record_detail_page 结构存在（含 _RecordDetailPageState，非空文件）',
         p05.contains('class _RecordDetailPageState'), '文件缺失或结构异常');
@@ -654,13 +750,26 @@ Future<void> main() async {
     check('⑨ _roundDiv 实现逐字一致',
         p05.contains('return (numerator + denominator ~/ 2) ~/ denominator;'),
         '_roundDiv 与脚本默认实现不一致');
-    check('⑩ 重算调用引擎（rule 由快照重建）',
-        p05.contains('const AmountEngine().compute(') &&
-            p05.contains('isOvertime: rd.overtime,'),
-        '未见引擎重算 / 倍率未取自快照');
+    // ⑩ **加固（审计 F4）**：旧式只查 `isOvertime: rd.overtime,` 一个字面量
+    //   ⇒ 把 `record_detail_page.dart:218` 的 `isWeekend: rd.weekend,` 改成 `rd.holiday,`
+    //   仍 76/0（"3 档命中只查 1 档"的单点逃逸）。现**切片到引擎调用的 `AmountInput(...)` 实参**，
+    //   把三档取值**逐处**列出并逐一比对（各恰 1 处且分别 == rd.overtime / rd.weekend / rd.holiday）。
+    final p05EngCall = _parenAfter(p05Code, '.compute(');
+    final p05InputArgs = _parenAfter(p05EngCall, 'input: AmountInput(');
+    final p05Ot = _extractValues(p05InputArgs, 'isOvertime');
+    final p05Wk = _extractValues(p05InputArgs, 'isWeekend');
+    final p05Hd = _extractValues(p05InputArgs, 'isHoliday');
+    check('⑩ 重算调用引擎：三档命中上下文**逐处**取自冻结快照 rd'
+        '（isOvertime/isWeekend/isHoliday 各恰 1 处且分别 == rd.overtime/rd.weekend/rd.holiday）',
+        p05Code.contains('const AmountEngine().compute(') &&
+            p05Ot.length == 1 &&
+            p05Ot.single == 'rd.overtime' &&
+            p05Wk.length == 1 &&
+            p05Wk.single == 'rd.weekend' &&
+            p05Hd.length == 1 &&
+            p05Hd.single == 'rd.holiday',
+        'ot=$p05Ot（期望[rd.overtime]） wk=$p05Wk（期望[rd.weekend]） hd=$p05Hd（期望[rd.holiday]）');
     // 剥离注释后再扫（整行 + 行尾注释都要剥，避免注释里的说明文字制造假阳性）。
-    final p05Code =
-        p05.replaceAll(RegExp(r'(^|\s)//.*$', multiLine: true), '');
     check('⑪ 全页无浮点金额路径（禁 fen/100、double.parse、.round()、.toDouble()）',
         !RegExp(r'fen\s*/\s*100').hasMatch(p05Code) &&
             !RegExp(r'double\.parse\(').hasMatch(p05Code) &&
@@ -668,37 +777,59 @@ Future<void> main() async {
             !RegExp(r'\.toDouble\(\)').hasMatch(p05Code),
         '命中浮点金额路径禁令');
     // 重算禁用路径：_target() 内不得出现 listPricingRules（只看不重算）。
-    final targetIdx = p05.indexOf('_Target _target()');
-    final targetEnd = p05.indexOf('int _halfDayRatio(');
+    final targetIdx = p05Code.indexOf('_Target _target()');
+    final targetEnd = p05Code.indexOf('int _halfDayRatio(');
     final targetBody =
-        (targetIdx >= 0 && targetEnd > targetIdx) ? p05.substring(targetIdx, targetEnd) : '';
+        (targetIdx >= 0 && targetEnd > targetIdx) ? p05Code.substring(targetIdx, targetEnd) : '';
     check('⑫ _target() 重算体不含 listPricingRules（禁读现价，AC-P05-10）',
         targetBody.isNotEmpty && !targetBody.contains('listPricingRules'),
         '重算体内出现 listPricingRules 或片段未定位');
 
-    // P03：日历口径 + 色点补 alpha + **容错读**。
+    // P03：日历口径 + 色点补 alpha + **容错读**（一律作用于剥注释源码 p03Code）。
     check('⑬ calendar_page 用**容错读** listWorkRecordsLenient(（M-01）',
-        p03.contains('_db.listWorkRecordsLenient('), '未见容错读（M-01 未修）');
-    check('⑭ calendar_page 传 includeDraft: false（草稿不计入）',
-        p03.contains('includeDraft: false'), '未传 includeDraft:false');
-    check('⑮ calendar_page 传 includeDisabled: true, includeDeleted: true',
-        p03.contains('includeDisabled: true, includeDeleted: true'), '公司元数据未双 true');
-    check('⑯ calendar_page 色点补 alpha：Color(0xFF000000 | c)',
-        p03.contains('Color(0xFF000000 | c)'), '色点未补 alpha');
+        p03Code.contains('_db.listWorkRecordsLenient('), '未见容错读（M-01 未修）');
+    // ⑭ **加固（审计 F1）**：旧式 `p03.contains('includeDraft: false')` 被 `:12`/`:78` 的
+    //   doc 注释救活 ⇒ 代码 `false`→`true` 仍 76/0。现**切片到 `_db.listWorkRecordsLenient(...)`
+    //   实参**（剥注释后）——注释已剥，且断言只看该调用点实参，别处字面量无法救活。
+    final p03LenientArgs = _parenAfter(p03Code, '_db.listWorkRecordsLenient(');
+    check('⑭ calendar_page `_db.listWorkRecordsLenient(...)` 实参含 includeDraft: false'
+        '（剥注释 + 切片锚定实参，防注释/他处字面量救活）',
+        p03LenientArgs.contains('includeDraft: false') &&
+            !p03LenientArgs.contains('includeDraft: true'),
+        'lenient 实参=${p03LenientArgs.replaceAll(RegExp(r"\s+"), " ")}');
+    // ⑮ **加固（审计 F2）**：同类，旧式被 `:80` 注释救活。切片到 `_db.listCompanies(...)` 实参。
+    final p03CompaniesArgs = _parenAfter(p03Code, '_db.listCompanies(');
+    check('⑮ calendar_page `_db.listCompanies(...)` 实参含 includeDisabled: true, includeDeleted: true'
+        '（剥注释 + 切片锚定实参）',
+        p03CompaniesArgs.contains('includeDisabled: true') &&
+            p03CompaniesArgs.contains('includeDeleted: true') &&
+            !p03CompaniesArgs.contains('includeDisabled: false') &&
+            !p03CompaniesArgs.contains('includeDeleted: false'),
+        'listCompanies 实参=${p03CompaniesArgs.replaceAll(RegExp(r"\s+"), " ")}');
+    check('⑯ calendar_page 色点补 alpha：Color(0xFF000000 | c)（剥注释）',
+        p03Code.contains('Color(0xFF000000 | c)'), '色点未补 alpha');
     check('⑰ calendar_page 含 listHolidayMarks(',
-        p03.contains('_db.listHolidayMarks('), '未见节假日读取');
+        p03Code.contains('_db.listHolidayMarks('), '未见节假日读取');
 
     // P04：容错读 + 草稿不计入 + 分组 + 删除。
     check('⑱ day_detail_page 含 listWorkRecordsLenient(',
-        p04.contains('_db.listWorkRecordsLenient('), '未用容错读');
-    check('⑲ day_detail_page 草稿不计入合计（status != draft）',
-        p04.contains('status != RecordStatus.draft'), '未见草稿排除');
+        p04Code.contains('_db.listWorkRecordsLenient('), '未用容错读');
+    // ⑲ **加固（审计 F3）**：旧式 `p04.contains('status != RecordStatus.draft')` 被 `:301`/`:369`
+    //   的同类字面量救活 ⇒ `:128`（`_dayTotal` 过滤）改 `!=`→`==` 仍 76/0。
+    //   现**切片到 `_dayTotal` getter 体**（剥注释）精确判定，别处字面量无法救活。
+    final p04DayTotal = _slice(p04Code, 'int get _dayTotal', 'List<_CompanyGroup> get _groups');
+    check('⑲ day_detail_page `_dayTotal` 过滤为 `!= RecordStatus.draft`'
+        '（切片锚定 getter 体，剥注释；草稿不计入合计 AC-P04-02）',
+        p04DayTotal.isNotEmpty &&
+            _reCount(p04DayTotal, RegExp(r'status\s*!=\s*RecordStatus\.draft')) == 1 &&
+            !p04DayTotal.contains('status == RecordStatus.draft'),
+        '切片=${p04DayTotal.replaceAll(RegExp(r"\s+"), " ")}');
     check('⑳ day_detail_page 含 softDeleteWorkRecord(',
-        p04.contains('_db.softDeleteWorkRecord('), '未见软删调用');
+        p04Code.contains('_db.softDeleteWorkRecord('), '未见软删调用');
     check('㉑ day_detail_page 分组按 companyId',
-        p04.contains('map.putIfAbsent(w.companyId,'), '未见按公司分组');
+        p04Code.contains('map.putIfAbsent(w.companyId,'), '未见按公司分组');
     check('㉒ day_detail_page 点记录进 RecordDetailPage(',
-        p04.contains('RecordDetailPage(id: id)'), '未见 P05 入口');
+        p04Code.contains('RecordDetailPage(id: id)'), '未见 P05 入口');
 
     // ㉓ **强化（M-06 · 教训第 10 类：断言须能被回退修复置红）**：C-01 **页面级**守卫，
     // 由「整行字符串存在性」升级为**结构式断言**（仍属静态档，如实标注）。
