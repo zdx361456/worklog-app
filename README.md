@@ -84,11 +84,62 @@ flutter build apk --release
 
 ---
 
-## 四、目录结构
+## 四、仓库同步与工具脚本
+
+仓库同时推送到两个远端，**都走 SSH 22 端口**（本机 github.com:443 被代理拦死，必须走 SSH），因此推送不需要任何令牌。
+
+| 远端 | 地址 | 可见性 |
+|---|---|---|
+| `github` | `git@github.com:zdx361456/worklog-app.git` | 公开 |
+| `gitee` | `git@gitee.com:clouds_and_clouds_on_the_sea/worklog-app.git` | 公开 |
+
+日常操作**不用记 git 命令**，双击即可：
+
+| 双击这个 | 干什么 |
+|---|---|
+| `sync-repos.bat` | 提交 → 推 GitHub → 推 Gitee → **校验三处 HEAD 一致** |
+| `check-repos.bat` | 只读巡检双仓（不改任何东西） |
+
+对应的脚本在 `tool/`：
+
+| 文件 | 作用 |
+|---|---|
+| `tool/repos.conf` | **唯一配置点**：远端名 / owner / repo / 分支。换仓库只改这里 |
+| `tool/git-sync.sh` | 提交 + 双推 + HEAD 比对。支持 `-m "说明"`、`-n`（演练）、`--push-only`、`--only github\|gitee` |
+| `tool/check-repos.sh` | 只读巡检：远端配置 / HEAD 一致性 / 工作区状态 / SSH 连通性；加 `--online` 再查仓库可见性 |
+| `tool/cleanup.sh` | 把实施过程中的临时产物送进**回收站**。默认 DRY-RUN，加 `--apply` 才动手 |
+
+> **关于令牌**：脚本设计上**不需要令牌**（走 SSH）。`tool/repos.conf` 里也没有任何密钥。
+> 万一将来要查私有仓库，把令牌放在仓库**之外**的 `~/.workbuddy/secrets/worklog.env`，绝不写进本仓库。
+
+### `git-sync.sh` 的一条纪律
+
+推送后**一定回读远端 HEAD 做比对**——因为 `git push` 退出码 0 不等于「远端真的停在这个提交」（受保护分支、pre-receive hook 都可能静默吞掉）。
+任一远端对不上，脚本就以非 0 退出并标出来，不会假装成功。
+
+### `cleanup.sh` 的三道闸门
+
+临时产物清理天生危险，所以规则写死在脚本里：
+
+1. **默认 DRY-RUN**。不加 `--apply` 只列清单，一个字节都不动。
+2. **永不永久删除**。只走 Windows 回收站（`SHFileOperationW` + `FOF_ALLOWUNDO`），全部可还原。
+3. **范围硬闸门**。任何候选只要**不在本仓库根之下**，整体拒绝执行——
+   本机 `~/.workbuddy/` 下还有别的独立仓库（各有自己的 `_scratch`），按目录名模糊扫会误伤它们，所以这里是断言而不是靠约定。
+
+---
+
+## 五、目录结构
 
 ```
 .
 ├── build_apk.bat                  # 一键出包（Windows）
+├── sync-repos.bat                 # 一键提交并推双仓（Windows）
+├── check-repos.bat                # 一键双仓巡检（Windows）
+├── tool/                          # ★ 仓库运维脚本与配置
+│   ├── repos.conf                 #   双远端配置（唯一配置点，无密钥）
+│   ├── git-sync.sh                #   提交 + 双推 + HEAD 比对
+│   ├── check-repos.sh             #   只读巡检
+│   └── cleanup.sh                 #   临时产物送回收站（默认 DRY-RUN）
 ├── worklog-app/
 │   ├── app/                       # Flutter 应用主体
 │   │   ├── lib/
@@ -106,7 +157,7 @@ flutter build apk --release
 
 ---
 
-## 五、文档
+## 六、文档
 
 需求到实现的完整链路都在 `worklog-app/docs/`：
 
@@ -125,7 +176,7 @@ flutter build apk --release
 
 ---
 
-## 六、开发说明
+## 七、开发说明
 
 ### 依赖约束
 
@@ -142,7 +193,7 @@ flutter build apk --release
 
 ---
 
-## 七、已知事项
+## 八、已知事项
 
 - **交付件入库**：仓库内含约 53 MB 的 APK。每次重新构建都会在 git 历史里新增一个同量级 blob。
   如需长期高频出包，建议后续迁移到 Releases 分发。
