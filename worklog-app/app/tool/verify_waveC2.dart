@@ -5,14 +5,19 @@
 //             `lib/services/import_service.dart`、`lib/db/database.dart`、`lib/services/id_gen.dart`），
 //             用 `sqflite_common_ffi` **内存库**真跑：序列化 / 反序列化 / 事务落库 / 谓词 /
 //             六表往返 — 结论可直接采信（服务层 + DB 层）。
-//   【读码级】 ① UI 私有方法 `_buildBackupData`（`lib/ui/export_backup_page.dart`）不可从外部调用 →
-//             本脚本以**逐字相同的六个公开 DB 调用**复刻组装（见 `buildBackup`，行号对照见下）；
-//             ② `lib/ui/export_backup_page.dart` 的点击/文件读写/分享（path_provider/share_plus/
-//             file_picker）**不覆盖** → 属 `[真机]`/【仅类型编译】。
-//   【静态级】 §7 读 `lib/ui/export_backup_page.dart` / `lib/services/import_service.dart`
-//             **源码文本**做落点断言（可被文件证伪；覆盖 UI 私有分支 MAJ-2/MAJ-3/MIN-3 落点）。
+//   【读码级→已补强】 ① UI 私有方法 `_buildBackupData`（`lib/ui/export_backup_page.dart`）不可从
+//             外部调用 → §2 的 `buildBackup` 仍为**逐字复刻**（仅证 DB 层语义正确）；
+//             **但 §2b 已对真页面做源码切片**（剥注释 + 花括号配对 + 提取六调用实参），
+//             断言 `includeDraft`/`includeDeleted`/`includeDisabled` 的**实参值** ⇒ 交付页
+//             「改 `includeDraft: true→false`」**必红**（堵审计假覆盖 A；原为「只验复刻」）。
+//   【静态级·切片】 §7 读 `lib/ui/export_backup_page.dart` / `lib/services/import_service.dart`
+//             **剥注释后源码**做落点/接线断言：MAJ-1（`verdict.ok` **真参与分支**且 `throw`）、
+//             MAJ-2/MAJ-3、MIN-3、merge 跳过守卫×5（堵审计假覆盖 B/D；原仅证「字符串存在」）。
 //   【实测级·新增】 §6 直接调 `ImportService.verifyImportInvariants`（**公共函数**，UI 事务内同款），
-//             真跑 merge 场景 + (A)/(B)/(C) 反证 —— 对 MAJ-1 修复有**真实证伪力**（非复刻）。
+//             真跑 merge 场景 + (A)/(B)/(C) 反证 **+ overwrite 策略分支（AC-P13-09 F2）** 正负例
+//             —— 对 MAJ-1 修复有**真实证伪力**（非复刻）；另真调 `planImport`/`softWarnings`
+//             （AC-P13-07）+ `assertExportConsistency` **负例对照**（AC-61/审计假覆盖 C）。
+
 //   【不覆盖】 平台库落盘/分享、对话框交互、Tab 导航 — 须末次出包真机验收。
 //
 // 跑法（本机可复现，`--disable-dart-dev` + `WORKLOG_USE_SYSTEM_SQLITE=1` 缺一报 CreateFile failed 231）：
@@ -21,7 +26,9 @@
 //   "<FR>\bin\cache\dart-sdk\bin\dart.exe" --disable-dart-dev tool\verify_waveC2.dart
 //
 // 契约来源：
-//   · `docs/04-迭代/2026-10-05/补齐规格07剩余页/02-需求与验收.md` §D.11（`AC-P13-01/03/07/09/11`）
+//   · `docs/04-迭代/2026-10-05/补齐规格07剩余页/02-需求与验收.md` §D.11
+//     （`AC-P13-01/03/04/06/07/08/09/11`——`01/03/09/11` 原覆盖；`04`(无千分位)/`06`
+//     (schema_version 过高文案)/`07`(冲突三选)/`08`(覆盖前自动备份) 本轮补断言）
 //     + §C.3.1（`AC-Q23-01~04`，U-2 谓词）
 //   · `docs/07-UI实现规格.md` §4.3（I-4 全量读）:`803-843`
 //
@@ -73,6 +80,78 @@ void check(String name, bool ok, [String? detail]) {
   }
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// 静态读源码工具（**复用 `tool/verify_waveD2.dart` 的剥注释 + 精确锚定/计数手法**）
+//   用途：对**交付页/服务真实源码**做切片断言，取代/补强「脚本内同构复刻」——
+//   这是审计报告「假覆盖 A/B/D」的修复手段（复刻不算验实现，切片才算）。
+// ══════════════════════════════════════════════════════════════════════════
+
+String _read(String relPath) {
+  final f = File(relPath);
+  if (!f.existsSync()) return '';
+  return f.readAsStringSync();
+}
+
+/// 剥注释（整行 `//…` + 行尾 `//…`），multiLine。
+final RegExp _commentRe = RegExp(r'(^|\s)//.*$', multiLine: true);
+
+String _stripComments(String src) => src.replaceAll(_commentRe, '');
+
+/// `needle` 在 `code` 中的**总出现次数**（不重叠）。
+int _count(String code, String needle) {
+  if (needle.isEmpty) return 0;
+  var c = 0;
+  var i = code.indexOf(needle);
+  while (i >= 0) {
+    c++;
+    i = code.indexOf(needle, i + needle.length);
+  }
+  return c;
+}
+
+/// 正则命中处数。
+int _reCount(String code, RegExp re) => re.allMatches(code).length;
+
+/// 取 `marker` 所在方法/函数体的完整块（花括号配对）。marker 取**含返回类型的签名**
+/// （如 `Future<BackupData> _buildBackupData()`），避免误命中调用点。
+String _blockAfter(String code, String marker) {
+  final i = code.indexOf(marker);
+  if (i < 0) return '';
+  final open = code.indexOf('{', i);
+  if (open < 0) return '';
+  var depth = 0;
+  for (var j = open; j < code.length; j++) {
+    final c = code[j];
+    if (c == '{') {
+      depth++;
+    } else if (c == '}') {
+      depth--;
+      if (depth == 0) return code.substring(i, j + 1);
+    }
+  }
+  return code.substring(i);
+}
+
+/// 取 `marker` 之后**第一个** `(` 到配对 `)` 的完整表达式（含 `marker`）。
+/// 用于提取函数**实参列表**（如 `db.listWorkRecords( … )` 的六个 include 实参）。
+String _parenAfter(String code, String marker) {
+  final i = code.indexOf(marker);
+  if (i < 0) return '';
+  final open = code.indexOf('(', i);
+  if (open < 0) return '';
+  var depth = 0;
+  for (var j = open; j < code.length; j++) {
+    final c = code[j];
+    if (c == '(') {
+      depth++;
+    } else if (c == ')') {
+      depth--;
+      if (depth == 0) return code.substring(i, j + 1);
+    }
+  }
+  return code.substring(i);
+}
+
 // ── 样本（**全部本地格式 id**，验证 U-2 放宽后的端到端往返）──
 final _ledgerId = newId('led');
 final _coA = newId('co'); // 启用、有账
@@ -90,7 +169,8 @@ final _base = DateTime(2026, 9, 30, 9, 0);
 DateTime _t(int i) => _base.add(Duration(minutes: i));
 
 /// `export_backup_page.dart` `_buildBackupData()` 的**逐字复刻**（六个公开 DB 调用完全一致）。
-/// 【读码级】UI 私有方法不可外部调用；本函数仅作搬运，序列化/反序列化/落库均为真源码（【实测级】）。
+/// 【读码级】**仅用于验证 DB 层全量读语义**；交付页装配由 §2b 源码切片断言覆盖（堵假覆盖 A）。
+/// 序列化/反序列化/落库均为真源码（【实测级】）。
 Future<BackupData> buildBackup(AppDatabase db, String ledgerId) async => BackupData(
       ledger: (await db.getLedger(ledgerId))!,
       companies: await db.listCompanies(
@@ -303,6 +383,14 @@ Future<void> main() async {
   check('非法 id 被拒绝（分支①/② 均不命中）',
       badErrs.any((e) => e.contains('非法 id')), '$badErrs');
 
+  // AC-P13-06（补登，原脚本零断言）：schema_version 过高 → 拒绝并给「请升级 App」专项文案
+  final futureMap = jsonDecode(jsonEncode(localMap)) as Map<String, dynamic>;
+  futureMap['schema_version'] = 99;
+  final futureErrs = imp.validate(futureMap);
+  check('AC-P13-06 schema_version 过高 → 拒绝且给「高于当前支持版本…请升级 App」专项文案',
+      futureErrs.any((e) => e.contains('高于当前支持版本') && e.contains('请升级 App')),
+      '$futureErrs');
+
   // 1000 个同批本地 id 无重复（AC-Q23-04）
   final ids = {for (var i = 0; i < 1000; i++) newId('wr')};
   check('连续生成 1000 个本地 id 无重复（AC-Q23-04）', ids.length == 1000,
@@ -331,6 +419,45 @@ Future<void> main() async {
   check('A3 workRecords 条数一致（含草稿）', data0.workRecords.length == reWorks.length);
   check('A4 paymentRecords 条数一致', data0.paymentRecords.length == rePays.length);
 
+  // ── §2b 交付页实参切片（**堵假覆盖 A**：`_buildBackupData` 不再只靠脚本复刻）──
+  //   审计根因：脚本 §2/§3 全程只驱动 `buildBackup()`（脚本内复刻），**从不触达**交付页
+  //   `_buildBackupData()` ⇒ 改真页面 `includeDraft: true→false` 仍 48/0。
+  //   修法：对**真页面源码切片**（剥注释 + 花括号配对取方法体 + 提取六调用实参），
+  //   断言 `includeDraft` 的**实参值**——改 false 必红（见审计 §三·假覆盖 A 注入点 `:126`）。
+  final pageCode = _stripComments(_read('lib/ui/export_backup_page.dart'));
+  final buildBody = _blockAfter(pageCode, 'Future<BackupData> _buildBackupData()');
+  check('A0 交付页 `_buildBackupData()` 方法体可切片（源码锚点存在）',
+      buildBody.isNotEmpty, 'len=${buildBody.length}');
+  final aCompanies = _parenAfter(buildBody, 'db.listCompanies(');
+  final aRules = _parenAfter(buildBody, 'db.listPricingRules(');
+  final aWorks = _parenAfter(buildBody, 'db.listWorkRecords(');
+  final aPays = _parenAfter(buildBody, 'db.listPaymentRecords(');
+  final aHols = _parenAfter(buildBody, 'db.listHolidayMarks(');
+  check('A1★ 交付页 listCompanies 实参含 includeDeleted:true + includeDisabled:true',
+      aCompanies.contains('includeDeleted: true') &&
+          aCompanies.contains('includeDisabled: true'),
+      aCompanies.replaceAll('\n', ' '));
+  check('A2★ 交付页 listPricingRules 实参含 includeDeleted:true + includeDisabled:true',
+      aRules.contains('includeDeleted: true') &&
+          aRules.contains('includeDisabled: true'),
+      aRules.replaceAll('\n', ' '));
+  check('A3★ 交付页 listWorkRecords 实参含 includeDraft:true（**改 false 必红**，堵假覆盖 A）',
+      aWorks.contains('includeDeleted: true') &&
+          aWorks.contains('includeDraft: true') &&
+          !aWorks.contains('includeDraft: false'),
+      aWorks.replaceAll('\n', ' '));
+  check('A4★ 交付页 listPaymentRecords 实参含 includeDeleted:true',
+      aPays.contains('includeDeleted: true'), aPays.replaceAll('\n', ' '));
+  check('A5★ 交付页 listHolidayMarks 实参含 ledgerId 过滤（非全账本混入）',
+      aHols.contains('ledgerId:'), aHols.replaceAll('\n', ' '));
+  final assertBody = _blockAfter(pageCode, 'Future<void> _assertFullExportCounts(');
+  check('A6★ 交付页 `_assertFullExportCounts` 右值=显式全量读（四表 include 齐备）',
+      assertBody.isNotEmpty &&
+          _reCount(assertBody, RegExp(r'includeDeleted:\s*true')) >= 3 &&
+          assertBody.contains('includeDisabled: true') &&
+          assertBody.contains('includeDraft: true'),
+      'len=${assertBody.length} incDel=${_reCount(assertBody, RegExp(r"includeDeleted:\s*true"))}');
+
   // A5 一致性断言（AC-61）
   final export = const ExportService();
   final fixedAt = DateTime(2026, 9, 30, 12, 0);
@@ -341,6 +468,34 @@ Future<void> main() async {
     exportedJson: export.toMap(data0, exportedAt: fixedAt, appVersion: '1.0.0'),
   );
   check('A5 assertExportConsistency 通过（AC-61）', consistent);
+
+  // ── A5 负例（**堵假覆盖 C**：`assertExportConsistency` 无负例对照 = 半 no-op 仍绿）──
+  //   审计根因：原断言只验「正确数据下返回 true」，无法区分「真校验」与「no-op」。
+  //   修法：构造**不一致**导出输入（篡改来件 JSON 的应收/已收合计），断言函数返回 false。
+  final exportedMap0 = export.toMap(data0, exportedAt: fixedAt, appVersion: '1.0.0');
+  final tamperRecv = jsonDecode(jsonEncode(exportedMap0)) as Map<String, dynamic>;
+  for (final r in (tamperRecv['work_records'] as List).cast<Map>()) {
+    if (r['id'] == _wrA) r['amount_snapshot'] = 0; // 应收 12000 → 0
+  }
+  final negRecv = export.assertExportConsistency(
+    workRecords: data0.workRecords,
+    paymentRecords: data0.paymentRecords,
+    exportedJson: tamperRecv,
+  );
+  check('A5-负例① 篡改导出**应收**合计 → assertExportConsistency 返回 false（堵假覆盖 C）',
+      negRecv == false, '返回 $negRecv');
+
+  final tamperGot = jsonDecode(jsonEncode(exportedMap0)) as Map<String, dynamic>;
+  for (final p in (tamperGot['payment_records'] as List).cast<Map>()) {
+    if (p['id'] == _pmA) p['amount'] = 0; // 已收 5000 → 0
+  }
+  final negGot = export.assertExportConsistency(
+    workRecords: data0.workRecords,
+    paymentRecords: data0.paymentRecords,
+    exportedJson: tamperGot,
+  );
+  check('A5-负例② 篡改导出**已收**合计 → assertExportConsistency 返回 false（堵假覆盖 C）',
+      negGot == false, '返回 $negGot');
 
   // ═══════════════════ §3 AC-62 往返：导出→清空→导入→再导出，逐字节等价 ═══════════════════
   stdout.writeln('\n[3] AC-62 往返无损：导出 → 清空 → 导入 → 再导出（六表逐字节等价）');
@@ -439,6 +594,17 @@ Future<void> main() async {
       csvW.startsWith('\uFEFF') && csvP.startsWith('\uFEFF'));
   check('CSV 金额两位小数（12000 分 → 120.00）', csvW.contains('120.00'));
   check('CSV 无 ¥ 符号', !csvW.contains('¥') && !csvP.contains('¥'));
+  // AC-P13-04 补充（02:790 要求「无千分位」）：1234567 分 → 12345.67，**不得**出现 12,345.67
+  final bigCsv = export.workRecordsCsv(
+    [_work('wrBig', companyId: _coA, workDate: '2026-09-30', amount: 1234567, tIndex: 70)],
+    companyNames,
+    ruleNames,
+  );
+  check('CSV 金额**无千分位逗号**（1234567 分 → 12345.67，非 "12,345.67"）',
+      bigCsv.contains('12345.67') &&
+          !bigCsv.contains('12,345.67') &&
+          !RegExp(r'\d{1,3}(,\d{3})+\.\d').hasMatch(bigCsv),
+      bigCsv.split('\n').take(3).join(' | '));
 
   // ═══════════ §6 导入后不变量校验（R55/R57）：真实驱动 verifyImportInvariants ═══════════
   //  真实驱动：直接调 `ImportService.verifyImportInvariants`（**公共函数**，非复刻）
@@ -533,6 +699,44 @@ Future<void> main() async {
   };
   final localIds = pre.ids;
   final newIds = incIdSet.difference(localIds)..remove(incomingData.ledger.id);
+
+  // ── §6·AC-P13-07：id 冲突三选（`planImport` 真驱动）+ localIds 六表全量（页面切片）──
+  //   审计根因：头部**声称覆盖** `AC-P13-07`，但原脚本**零断言**（无 planImport/_collectLocalIds/
+  //   conflict/reject 字样）⇒「声称覆盖却无断言」。修法：真调 `ImportService.planImport`
+  //   （纯函数，非复刻）+ 对交付页 `_collectLocalIds`/`_runImport` 做源码切片。
+  final planReject = imp.planImport(
+      localIds: localIds, incomingIds: incIdSet, strategy: ImportStrategy.reject);
+  check('AC-P13-07 planImport reject：存在冲突 → abort=true 且 conflicts 非空',
+      planReject.abort && planReject.conflicts.isNotEmpty,
+      'abort=${planReject.abort} conflicts=${planReject.conflicts.length}');
+  final planMerge = imp.planImport(
+      localIds: localIds, incomingIds: incIdSet, strategy: ImportStrategy.merge);
+  final planOverwrite = imp.planImport(
+      localIds: localIds, incomingIds: incIdSet, strategy: ImportStrategy.overwrite);
+  check('AC-P13-07 planImport merge/overwrite：有冲突但**不中止**（abort=false）',
+      !planMerge.abort && !planOverwrite.abort,
+      'merge.abort=${planMerge.abort} overwrite.abort=${planOverwrite.abort}');
+  final planClean = imp.planImport(
+      localIds: const {}, incomingIds: incIdSet, strategy: ImportStrategy.reject);
+  check('AC-P13-07 负例 planImport：无冲突 → reject **亦** abort=false（abort 非恒真）',
+      !planClean.abort, 'abort=${planClean.abort}');
+  final softWarnClean = imp.softWarnings(incomingData);
+  check('AC-P13-07 软警告 softWarnings 可真驱动（含软删 → 至少 1 条软删提示）',
+      softWarnClean.any((e) => e.contains('软删')), '$softWarnClean');
+  final collectLocalBody =
+      _blockAfter(pageCode, 'Future<Set<String>> _collectLocalIds()');
+  check('AC-P13-07 交付页 `_collectLocalIds` 覆盖六表且四表带 includeDeleted:true',
+      collectLocalBody.contains('listCompanies(') &&
+          collectLocalBody.contains('listPricingRules(') &&
+          collectLocalBody.contains('listWorkRecordsLenient(') &&
+          collectLocalBody.contains('listPaymentRecordsLenient(') &&
+          collectLocalBody.contains('listHolidayMarks(') &&
+          _reCount(collectLocalBody, RegExp(r'includeDeleted:\s*true')) >= 2,
+      'len=${collectLocalBody.length} incDel=${_reCount(collectLocalBody, RegExp(r"includeDeleted:\s*true"))}');
+  final runImportBody = _blockAfter(pageCode, 'Future<void> _runImport(');
+  check('AC-P13-07 交付页 `_runImport` 调 `planImport(` 并**消费** `plan.abort`',
+      runImportBody.contains('planImport(') && runImportBody.contains('plan.abort'),
+      'planImport=${runImportBody.contains('planImport(')} plan.abort=${runImportBody.contains('plan.abort')}');
 
   // merge 效果（**逐字复刻 `_doImportTransaction` 的 merge 跳过分支**；写为真 DB 操作）
   await db.transaction((txn) async {
@@ -664,28 +868,94 @@ Future<void> main() async {
       (await db.listHolidayMarks()).any((h) => h.id == swappedHm) &&
           !(await db.listHolidayMarks()).any((h) => h.id == _hmA));
 
+  // ── §6·AC-P13-09：overwrite 策略分支真驱动（原脚本仅驱动 merge ⇒ overwrite 的 F2 分支无证伪力）──
+  final ovPostOk = mkSnap(
+    companies: incomingData.companies,
+    rules: incomingData.pricingRules,
+    works: incomingData.workRecords,
+    pays: incomingData.paymentRecords,
+    hols: incomingData.holidayMarks,
+  );
+  final vOvOk = imp.verifyImportInvariants(
+    strategy: ImportStrategy.overwrite,
+    pre: pre,
+    post: ovPostOk,
+    data: incomingData,
+    newIds: newIds,
+  );
+  check('AC-P13-09 overwrite 正常：verifyImportInvariants ok（F2 覆盖后应收/已收一致 + F4 逐条相等）',
+      vOvOk.ok, '${vOvOk.all}');
+  final vOvBad = imp.verifyImportInvariants(
+    strategy: ImportStrategy.overwrite,
+    pre: pre,
+    post: mkSnap(
+      companies: ovPostOk.companies,
+      rules: ovPostOk.pricingRules,
+      works: [
+        for (final w in ovPostOk.workRecords)
+          w.id == newWr
+              ? _work(newWr,
+                  companyId: _coA,
+                  workDate: '2026-09-27',
+                  amount: 1,
+                  tIndex: 51)
+              : w,
+      ],
+      pays: ovPostOk.paymentRecords,
+      hols: ovPostOk.holidayMarks,
+    ),
+    data: incomingData,
+    newIds: newIds,
+  );
+  check('AC-P13-09 负例：覆盖后**应收不一致** → 报「覆盖后应收不一致」（F2 非空转）',
+      vOvBad.failures.any((e) => e.contains('覆盖后应收不一致')),
+      '${vOvBad.failures}');
+
   // ═══════════ §7 静态核对（文件级可证伪；覆盖 UI 私有分支，标注【静态/读码】）═══════════
-  stdout.writeln('\n[7] 静态核对（读源码文本，可被文件证伪）—— MAJ-2/MAJ-3/MIN-3/R55 落点');
-  final page = File('lib/ui/export_backup_page.dart').readAsStringSync();
-  final svcSrc = File('lib/services/import_service.dart').readAsStringSync();
+  stdout.writeln('\n[7] 静态核对（**剥注释后**读源码文本 + 切片，可被文件证伪）'
+      '—— MAJ-1/2/3、MIN-3、R55/R57、merge 跳过守卫');
+  // pageCode 已于 §2b 读取并剥注释；此处读服务源码（同样剥注释，防注释内字样假阳性）
+  final svcSrc = _stripComments(_read('lib/services/import_service.dart'));
   check('MAJ-3：坏行文案已改「导出将被中止」，且**不再**含伪文案「仍会原样导出」',
-      page.contains('导出将被中止') && !page.contains('仍会原样导出'));
+      pageCode.contains('导出将被中止') && !pageCode.contains('仍会原样导出'));
   check('MAJ-2：`_autoBackupBeforeOverwrite` 返回 bool（不再吞失败）',
-      RegExp(r'Future<bool>\s+_autoBackupBeforeOverwrite').hasMatch(page));
-  check('MAJ-2：自动备份失败分支存在（`if (!backedUp)` 中止导入）',
-      page.contains('if (!backedUp)'));
-  check('MAJ-1：事务内调用 `verifyImportInvariants`（断言口径真实接线）',
-      page.contains('verifyImportInvariants'));
+      RegExp(r'Future<bool>\s+_autoBackupBeforeOverwrite').hasMatch(pageCode));
+  check('MAJ-2：自动备份失败分支**真的 return 中止**（`if (!backedUp) { … return; }`）',
+      RegExp(r'if\s*\(\s*!\s*backedUp\s*\)\s*\{[\s\S]{0,240}?\breturn\b')
+          .hasMatch(runImportBody));
+  // ── MAJ-1（堵假覆盖 D）：原断言 `page.contains('verifyImportInvariants')` 只证「字符串在」，
+  //    改 `if (false && !verdict.ok)` 仍绿。修法：切片到 `_doImportTransaction` 事务体，
+  //    断言 `verdict.ok` **真的参与分支**且分支体内 `throw`（校验结果被消费，非旁路）。
+  final txBody = _blockAfter(pageCode, 'Future<void> _doImportTransaction(');
+  check('MAJ-1：`_doImportTransaction` 事务内调用 `verifyImportInvariants(`（调用点存在）',
+      _count(txBody, 'verifyImportInvariants(') == 1,
+      '命中=${_count(txBody, "verifyImportInvariants(")}');
+  final verdictBranchRe =
+      RegExp(r'if\s*\(\s*!\s*verdict\.ok\s*\)\s*\{[\s\S]{0,240}?throw');
+  check('MAJ-1★：校验结果 `verdict.ok` 真实接线（`if (!verdict.ok) { … throw … }`）——改坏必红',
+      _reCount(txBody, verdictBranchRe) == 1,
+      '命中=${_reCount(txBody, verdictBranchRe)}（期望 1）');
   check('MIN-3：`_startImport` 入口即置 `_busy`',
       RegExp(r'_startImport\(\) async \{[\s\S]*?setState\(\(\) => _busy = true\)',
               dotAll: true)
-          .hasMatch(page));
+          .hasMatch(pageCode));
   check('R55：merge (A)(B)(C) 三条检查均落地 import_service',
       svcSrc.contains("'(A) ") &&
           svcSrc.contains("'(B) ") &&
           svcSrc.contains("'(C) "));
-  check('R57：节假日以 (ledger_id,date) 为键断言（id 漂移宽容）',
-      svcSrc.contains('_holidayByKey') && svcSrc.contains('ledger_id,date'));
+  check('R57：节假日以 (ledger_id@date) 复合键断言（**代码锚点**，id 漂移宽容）',
+      svcSrc.contains('_holidayByKey') &&
+          svcSrc.contains(r"ledger_id']}@${m['date']}"));
+  // ── B（堵假覆盖 B）：`_doImportTransaction` 五表 merge 跳过守卫齐备。原脚本用**自身内联复刻**
+  //    驱动 merge，改真页面 `:531-536` 的 `if (strategy == … && localIds.contains(w.id))`
+  //    → `if (false)` 仍 48/0。修法：切片事务体，断言五表守卫各 1（含 `continue;` 各 1）。
+  final mergeGuardRe =
+      RegExp(r'if\s*\(\s*strategy\s*==\s*ImportStrategy\.merge\s*&&\s*localIds\.contains\(');
+  final guardCount = _reCount(txBody, mergeGuardRe);
+  final continueCount = _count(txBody, 'continue;');
+  check('B★：`_doImportTransaction` 五表 merge 跳过守卫齐备（guard×5 + continue×5；改 `if (false)` 必红）',
+      guardCount == 5 && continueCount == 5,
+      'guard=$guardCount(期望5) continue=$continueCount(期望5)');
 
   stdout.writeln('\n══════════════════════════════════════════════');
   stdout.writeln('结果：$_pass 通过 / $_fail 失败');
