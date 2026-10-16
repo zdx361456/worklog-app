@@ -8,6 +8,12 @@
 ///   （异常类型与原文均打印），而 `listCompanies(双 true)` / `listPaymentRecords()` 不受影响。
 ///   → 这证明了「降级的前提条件成立」：脏金额会以 `FormatException` 的形式出现在这两个查询上。
 ///
+/// 【实测级 / 强证据】第 4 节（加固新增，2026-10-17）：
+///   第 0~2 节只脏写 `work_record.amount_snapshot`，**收款侧** `payment_record.amount` 的
+///   聚合守卫从未被观测（把守卫改成跳过 `payment_record` 仍 exit 0）。第 4 节把 work_record
+///   复位、改脏 payment_record.amount，断言 aggregate/aggregateByCompany **仍然**抛
+///   `FormatException`，把这条缺口补成「能置红」的真断言（q5/q6，纳入 ok 门控）。
+///
 /// 【同构模拟 / 弱证据】第 3 节：
 ///   页内 `_guard<T>` 是 `_OverviewPageState` 的**私有实例方法**，脚本里**拿不到、无法调用**。
 ///   第 3 节用下面 `guard<T>()` —— 一份**逐字复刻** `overview_page.dart:87-93` 的同构副本 ——
@@ -71,6 +77,7 @@ Future<T?> guard<T>(Future<T> future) async {
 const _ledgerId = 'b0000000-0000-4000-8000-000000000001';
 const _cidA = 'b0000000-0000-4000-8000-00000000000a';
 const _wid1 = 'b0000001-0000-4000-8000-000000000001';
+const _pid1 = 'b0000001-0000-4000-8000-000000000002';
 
 final _t0 = DateTime(2026, 10, 1, 9, 0);
 
@@ -106,7 +113,7 @@ Future<void> main() async {
     updatedAt: _t0,
   ));
   await db.upsertPaymentRecord(PaymentRecord(
-    id: 'b0000001-0000-4000-8000-000000000002',
+    id: _pid1,
     paymentDate: _t0,
     companyId: _cidA,
     amount: 50000,
@@ -186,15 +193,59 @@ Future<void> main() async {
   print('  q3  listCompanies(双 true) == null ? ${res[2] == null}  → 未降级（卡片照常渲染）');
   print('  q4  listPaymentRecords()   == null ? ${res[3] == null}  → 未降级（最近收款日期可用）');
 
+  // ── 4.【实测级·对称观测】把脏值改到 payment_record，验证「收款侧守卫」同样生效 ──
+  //
+  // 为什么要有这一节：第 0~2 节只脏写了 `work_record.amount_snapshot`。
+  // 若把 `_assertAggregateColumnTypes` 改成 `if (rows.isEmpty || table == 'payment_record') return;`
+  // （即**只**跳过收款表守卫），第 0~3 节的结论**一字不变**——脚本仍然 exit 0。
+  // 这是覆盖面缺口：收款侧 `payment_record.amount` 的聚合守卫从未被观测。
+  // 本节把 work_record 复位为整数、改脏 payment_record.amount，再断言
+  // aggregate/aggregateByCompany **仍然**抛 FormatException，把缺口补上。
+  print('');
+  print('== 4. 对称观测：脏值改到 payment_record【实测级】（补收款侧守卫覆盖）==');
+  await raw.rawUpdate(
+    'UPDATE work_record SET amount_snapshot = ? WHERE id = ?',
+    [100000, _wid1],
+  );
+  await raw.rawUpdate(
+    'UPDATE payment_record SET amount = ? WHERE id = ?',
+    ['不是数字', _pid1],
+  );
+  final wVerify = await raw.rawQuery(
+      'SELECT typeof(amount_snapshot) AS t FROM work_record WHERE id = ?', [_wid1]);
+  final pVerify = await raw.rawQuery(
+      'SELECT typeof(amount) AS t, amount AS v FROM payment_record WHERE id = ?', [_pid1]);
+  print('  work_record.amount_snapshot typeof = ${wVerify.first['t']}（应为 integer，已复位）');
+  print('  payment_record.amount  库内实况 = ${pVerify.first}');
+
+  Future<bool> throwsFormat(Future<Object?> f) async {
+    try {
+      await f;
+      return false;
+    } catch (e) {
+      return e is FormatException;
+    }
+  }
+
+  final q5 = await throwsFormat(db.aggregate(null));
+  final q6 = await throwsFormat(db.aggregateByCompany());
+  print('  q5  aggregate(null)                    抛 FormatException ? $q5'
+      '  → 收款侧守卫生效（否则脏收款被静默按 0 计入）');
+  print('  q6  aggregateByCompany()               抛 FormatException ? $q6');
+  final okPayment = q5 && q6;
+
   final ok = res[0] == null &&
       res[1] == null &&
       res[2] != null &&
-      res[3] != null;
+      res[3] != null &&
+      okPayment;
   print('');
   print('──────────────────────────────────────────────');
   print(ok
       ? '结论【实测级】：脏金额 → aggregate/aggregateByCompany 抛 FormatException；'
           'listCompanies/listPaymentRecords 不受影响。降级前提成立。\n'
+          '结论【实测级·对称】：脏 work_record 与脏 payment_record 各自都能触发守卫 → '
+          '两表守卫均被测（q1/q2 覆盖 work_record，q5/q6 覆盖 payment_record）。\n'
           '结论【同构推理】：按 _guard 的同构写法包裹后，正是这四元组被逐一隔离。\n'
           '待读码核（读码级）：页内 _guard 只吞 FormatException（overview_page.dart:87-93）。'
       : '结论：与预期不符（见上）。');

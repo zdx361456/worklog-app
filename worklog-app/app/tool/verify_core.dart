@@ -1,6 +1,13 @@
 /// 核心逻辑验证脚本（纯 Dart，无需 Flutter）。
-/// 运行：在 app/ 目录下执行 `dart run tool/verify_core.dart`
-/// （需 Dart SDK；版本与安装方式见 docs/06-技术选型对比.md）。
+///
+/// **本机可复现的运行命令**（与 `verify_db.dart` 同口径，实测 104/0）：
+/// ```
+/// cd C:\Users\ZDX\WorkBuddy\2026-09-30-11-23-00\worklog-app\app
+/// "D:\workspace\software\installed\tools\FlyEnv-Data\app\flutter\3.47.4\bin\cache\dart-sdk\bin\dart.exe" --disable-dart-dev tool\verify_core.dart
+/// ```
+/// **不要用 `dart run`**：本机 Dart VM 存在进程创建缺陷（`CreateFile failed 231` /
+/// `process_win.cc:744`），`dart run` 触发的 native-assets 构建钩子必然失败。
+/// `--disable-dart-dev` 直跑 VM 可跳过该钩子（理由详见 `verify_db.dart` 头部）。
 ///
 /// 覆盖：金额引擎整数精度临界算例（R-2）、倍率取最高（Q12）、跨夜（AC-08/AC-11）、
 /// 草稿（AC-12）、手工覆盖（Q5）、剩余工资公司维度过滤（R-1）、
@@ -8,6 +15,7 @@
 library;
 
 import 'dart:convert';
+import 'dart:io';
 
 import '../lib/models/types.dart';
 import '../lib/models/pricing_rule.dart';
@@ -35,6 +43,21 @@ void check(String name, bool ok, [String? detail]) {
   }
 }
 
+/// A4 健壮性：执行 [body] 并对「抛异常」做显式捕获。
+///
+/// 与裸 `check(name, body())` 的区别：body 抛异常时**不再让整脚本崩溃**，
+/// 而是记一条失败并继续（保证末尾 `结果：N 通过 / M 失败` 一定被打印，不丢尾）。
+bool checkNoThrow(String name, bool Function() body) {
+  try {
+    final ok = body();
+    check(name, ok);
+    return ok;
+  } catch (e) {
+    check(name, false, '抛出异常: ${e.runtimeType}: $e');
+    return false;
+  }
+}
+
 PricingRule rule({
   required PricingMethod method,
   required int baseRate,
@@ -59,7 +82,26 @@ PricingRule rule({
       updatedAt: DateTime(2026, 1, 1),
     );
 
+/// A4 兜底包装：任何**未捕获**异常都不会让脚本「崩溃且不打印结果」。
+///
+/// 无论 `_run()` 正常还是抛异常，末尾的 `结果：N 通过 / M 失败` 一定被打印；
+/// 崩溃会被计入失败（`_fail` 至少 +1），再以非零退出码置红。
 void main() {
+  try {
+    _run();
+  } catch (e, st) {
+    if (_fail == 0) _fail = 1; // 崩溃即至少一条失败
+    print('  ✗ 未捕获异常导致中断: ${e.runtimeType}: $e');
+    print(st);
+  }
+  print('\n结果：$_pass 通过 / $_fail 失败');
+  // 用 `exit(1)` 而非 `throw StateError`：后者会在**已打印结果行之后**再吐一段
+  // `Unhandled exception ... #0 main` 堆栈，读者容易把「干净置红」误认成「脚本崩了」，
+  // 与 A4 想消除的「崩溃混淆」自相矛盾。`exit` 会先冲刷 stdout，结果行必定可见。
+  exit(_fail > 0 ? 1 : 0);
+}
+
+void _run() {
   const eng = AmountEngine();
 
   print('== 金额引擎：基础与整数精度 ==');
@@ -173,7 +215,8 @@ void main() {
   {
     const svc = ReceivableService();
     final now = DateTime(2026, 9, 30);
-    WorkRecord rec(String id, String c, int amt, {RecordStatus st = RecordStatus.confirmed}) =>
+    WorkRecord rec(String id, String c, int amt,
+            {RecordStatus st = RecordStatus.confirmed, DateTime? deletedAt}) =>
         WorkRecord(
           id: id,
           workDate: now,
@@ -185,14 +228,17 @@ void main() {
           amountSnapshot: amt,
           amountSource: AmountSource.auto,
           status: st,
+          deletedAt: deletedAt,
           createdAt: now,
           updatedAt: now,
         );
-    PaymentRecord pay(String id, String c, int amt) => PaymentRecord(
+    PaymentRecord pay(String id, String c, int amt, {DateTime? deletedAt}) =>
+        PaymentRecord(
           id: id,
           paymentDate: now,
           companyId: c,
           amount: amt,
+          deletedAt: deletedAt,
           createdAt: now,
           updatedAt: now,
         );
@@ -211,6 +257,30 @@ void main() {
     final s2 = svc.companySummary(companyId: 'c2', records: records, payments: payments);
     check('c2 剩余 = 20000（不被 c1 污染）', s2.remaining == 20000, '实际 ${s2.remaining}');
     check('全局剩余 = 25000', svc.globalRemaining(records: records, payments: payments) == 25000);
+
+    // A3 软删排除口径（§8 约束#3）：软删的「已确认」记录 / 收款不得计入应收/已收。
+    // 原脚本夹具里没有软删记录 → 删掉 receivable_service 里的 `if (isDeleted) continue;`
+    // 仍 81/0 全绿（假覆盖）。这里用**差值式**把它钉死：加入软删项后合计必须**不变**。
+    final delAt = DateTime(2026, 9, 29);
+    final delRecord = rec('w-del', 'c1', 77777, deletedAt: delAt); // 已确认但已软删
+    final delPayment = pay('p-del', 'c1', 12345, deletedAt: delAt); // 已软删收款
+
+    final s1WithDeleted = svc.companySummary(
+      companyId: 'c1',
+      records: [...records, delRecord],
+      payments: [...payments, delPayment],
+    );
+    check('软删记录不计入应收（receivable 不变）',
+        s1WithDeleted.receivable == s1.receivable, '实际 ${s1WithDeleted.receivable}');
+    check('软删收款不计入已收（received 不变）',
+        s1WithDeleted.received == s1.received, '实际 ${s1WithDeleted.received}');
+    check('软删记录不计入剩余（剩余不变）',
+        s1WithDeleted.remaining == s1.remaining, '实际 ${s1WithDeleted.remaining}');
+    // 差值式直击 receivable()/received() 两个分支（不经 companySummary 的 where 过滤）。
+    check('receivable() 跳过软删记录',
+        svc.receivable([...records, delRecord]) == svc.receivable(records));
+    check('received() 跳过软删收款',
+        svc.received([...payments, delPayment]) == svc.received(payments));
   }
 
   print('== 导出 / 导入往返 + 断言（§6.5）==');
@@ -259,8 +329,13 @@ void main() {
     );
 
     final json = exporter.toJson(data, exportedAt: now);
-    check('导出 JSON 含 format', json.contains('worklog-app-backup'));
+    // A2 结构断言（原写法 `json.contains('worklog-app-backup')` 只查值不查键：
+    // 把 json 里的键名 `format` 改成 `fmt` 后该断言仍绿 → 假覆盖）。
     final map = jsonDecode(json) as Map<String, dynamic>;
+    check('导出 JSON 顶层含键 format', map.containsKey('format'),
+        '顶层键: ${map.keys.toList()}');
+    check('导出 JSON format 值 == 期望 tag', map['format'] == kBackupFormat,
+        '实际 ${map['format']}');
 
     final errors = importer.validate(map);
     check('导入校验无硬错误', errors.isEmpty, '错误: $errors');
@@ -277,14 +352,15 @@ void main() {
           exportedJson: map,
         ));
 
-    // 坏文件应被拒绝：缺表
+    // 坏文件应被拒绝：缺表（A4：包 checkNoThrow，实现抛异常时置红而非崩溃丢尾）
     final bad = Map<String, dynamic>.from(map)..remove('payment_records');
-    check('缺表 → 拒绝导入', importer.validate(bad).isNotEmpty);
+    checkNoThrow('缺表 → 拒绝导入', () => importer.validate(bad).isNotEmpty);
 
     // N-2：值域非法（基础单价 ≤ 0）应被拒
     final badRate = jsonDecode(json) as Map<String, dynamic>;
     (badRate['pricing_rules'] as List)[0]['base_unit_price'] = 0;
-    check('值域非法(基础单价=0) → 拒绝导入', importer.validate(badRate).isNotEmpty);
+    checkNoThrow('值域非法(基础单价=0) → 拒绝导入',
+        () => importer.validate(badRate).isNotEmpty);
 
     // N-3：类型不符不应抛异常，而应转成错误清单
     final badType = jsonDecode(json) as Map<String, dynamic>;
@@ -296,7 +372,10 @@ void main() {
       threw = true;
     }
     check('N-3 类型不符不抛异常（返回错误清单）', !threw);
-    check('N-3 类型不符被报告为错误', importer.validate(badType).isNotEmpty);
+    // A4：此处原为裸 `check(..., importer.validate(badType).isNotEmpty)`，
+    // 实现若抛异常会让整脚本崩溃 exit=255、连末尾结果行都打不出（丢尾）。
+    checkNoThrow('N-3 类型不符被报告为错误',
+        () => importer.validate(badType).isNotEmpty);
 
     // P-1：standard_hours 类型不符须被 validate 拦下（否则 parse 的 as num? 会抛异常）
     final badSh = jsonDecode(json) as Map<String, dynamic>;
@@ -308,7 +387,8 @@ void main() {
       threwSh = true;
     }
     check('P-1 standard_hours 类型不符不抛异常', !threwSh);
-    check('P-1 standard_hours 类型不符被报告', importer.validate(badSh).isNotEmpty);
+    checkNoThrow('P-1 standard_hours 类型不符被报告',
+        () => importer.validate(badSh).isNotEmpty);
   }
 
   print('== 非法输入语义（N-9）==');
@@ -425,19 +505,47 @@ void main() {
   print('== DB Schema ==');
   {
     check('六张建表语句', kCreateTableStatements.length == 6);
-    for (final t in ['ledger', 'company', 'pricing_rule', 'work_record',
-        'payment_record', 'holiday_mark']) {
-      check('建表含 $t', kCreateTableStatements.any((s) => s.contains('CREATE TABLE IF NOT EXISTS $t')));
+
+    // A1 加固：原写法 `s.contains('CREATE TABLE IF NOT EXISTS $t')` 是**子串**匹配，
+    // 两处逃逸已被实测：
+    //   ① 把 `work_record (` 改成 `work_records (` → 子串仍命中 → 仍 81/0；
+    //   ② 删掉 `work_record` 的 `amount_snapshot` 整列 → 脚本完全不校验列 → 仍 81/0。
+    // 修法：① 表名后强制词边界（紧跟 `(`）；② 每表断言关键列存在（列名按行首词边界匹配）。
+    String? createStmtOf(String t) {
+      final re = RegExp(
+          'CREATE TABLE IF NOT EXISTS\\s+${RegExp.escape(t)}\\s*\\(');
+      for (final s in kCreateTableStatements) {
+        if (re.hasMatch(s)) return s;
+      }
+      return null;
     }
+
+    bool hasColumn(String stmt, String col) =>
+        RegExp('^\\s*${RegExp.escape(col)}\\s', multiLine: true).hasMatch(stmt);
+
+    // 每表 1~3 个关键列（含审计列与口径金额列）。
+    const keyColumns = <String, List<String>>{
+      'ledger': ['id', 'mode'],
+      'company': ['id', 'ledger_id', 'tag_color'],
+      'pricing_rule': ['id', 'base_rate'],
+      'work_record': ['id', 'attribution_date', 'unit_price_snapshot', 'amount_snapshot'],
+      'payment_record': ['id', 'pay_date', 'amount'],
+      'holiday_mark': ['id', 'ledger_id', 'rate'],
+    };
+
+    keyColumns.forEach((t, cols) {
+      final stmt = createStmtOf(t);
+      check('建表含 $t（词边界）', stmt != null,
+          stmt == null ? '未找到 CREATE TABLE IF NOT EXISTS $t (' : null);
+      for (final c in cols) {
+        check('  $t 含列 $c', stmt != null && hasColumn(stmt, c));
+      }
+    });
+
     check('节假日唯一约束 (ledger_id, date)',
         kCreateTableStatements.any((s) => s.contains('UNIQUE (ledger_id, date)')));
     check('含归属日索引', kCreateIndexStatements
         .any((s) => s.contains('idx_work_record_attribution_date')));
     check('数据库版本 = 1', kDbVersion == 1);
-  }
-
-  print('\n结果：$_pass 通过 / $_fail 失败');
-  if (_fail > 0) {
-    throw StateError('存在 $_fail 项失败');
   }
 }
