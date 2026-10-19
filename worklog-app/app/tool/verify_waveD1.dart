@@ -645,10 +645,24 @@ void _staticLayer() {
       'A3 含倍率口径固定文案「取最高档，不叠加」（AC-P09-05）', '未找到该文案');
 
   // A4：不触碰历史（评审红线）
-  _check(!ruleEdit.contains('updateWorkRecord') &&
-          !ruleEdit.contains('replaceWorkRecordSnapshot'),
-      'A4 **不含** updateWorkRecord / replaceWorkRecordSnapshot（AC-P09-13 红线）',
-      '命中：${ruleEdit.contains('updateWorkRecord')} / ${ruleEdit.contains('replaceWorkRecordSnapshot')}');
+  //   GAP-43：原断言只列 `updateWorkRecord` / `replaceWorkRecordSnapshot` **两个字符串**，
+  //   而工作记录的写库 API 实为四族（`lib/db/database.dart`）：
+  //     `upsertWorkRecord(On)` :596/600　`updateWorkRecordMeta(On)` :744/761
+  //     `replaceWorkRecordSnapshot(On)` :802/833　`softDeleteWorkRecord(On)` :877/881
+  //   只查两族 ⇒ 在 P09 里加一句 `softDeleteWorkRecord(...)` 或 `upsertWorkRecord(...)`
+  //   仍会全绿（把历史改坏却无人报警）。改为**全族并集**断言。
+  const wrWriteApis = <String>[
+    'upsertWorkRecord', // 覆盖 upsertWorkRecordOn
+    'updateWorkRecordMeta', // 覆盖 updateWorkRecordMetaOn（旧断言靠子串顺手覆盖）
+    'replaceWorkRecordSnapshot', // 覆盖 replaceWorkRecordSnapshotOn
+    'softDeleteWorkRecord', // 覆盖 softDeleteWorkRecordOn ← 旧断言完全漏掉
+  ];
+  final wrWrites = wrWriteApis.where(ruleEdit.contains).toList();
+  _check(
+      wrWrites.isEmpty,
+      'A4 **不含**工作记录写库 API **全族** ${wrWriteApis.length} 项'
+      '（upsert / updateMeta / replaceSnapshot / softDelete）[AC-P09-13 红线 · GAP-43]',
+      '命中：$wrWrites');
 
   // A5：P07 入口闭合（占位文案消失 + 指向真页）
   _check(!companyDetail.contains('计价规则编辑将在下个版本上线'),
@@ -656,6 +670,69 @@ void _staticLayer() {
       '仍命中占位文案');
   _check(companyDetail.contains('RuleEditPage('),
       'A5b company_detail_page 剥注释后含 RuleEditPage(（入口指向真页）', '未找到 RuleEditPage(');
+
+  // A5c **GAP-45**：P05 保存流的真实契约（不是「是否走事务」）
+  //   原缺口表述为「P05 保存流是否真走事务」。**读码结论：不走事务，且不需要** ——
+  //   `_saveNew` 是单表单行写（`upsertWorkRecord`）、`_saveEdit` 是单表单行改
+  //   （`updateWorkRecordMeta`），没有跨表一致性要求。硬写一条「必须有 transaction」的
+  //   断言等于**编造契约**（合规实现会被判红），故改为断言它真正承诺的东西：
+  //   ① 每条保存路径的写库调用**唯一**（不得旁路多写一次，否则重复入账）
+  //   ② `_saving` 双向闭合（置 true 防连点、复位防异常后按钮永久卡死）
+  final saveNew = _slice(workForm, 'Future<void> _saveNew()', 'Future<void> _saveEdit()');
+  final saveEdit = _slice(workForm, 'Future<void> _saveEdit()', 'void _snack(');
+  _check(
+      saveNew.isNotEmpty &&
+          _count(saveNew, 'upsertWorkRecord(') == 1 &&
+          _count(saveNew, 'updateWorkRecordMeta(') == 0 &&
+          _count(saveNew, '_saving = true') >= 1 &&
+          _count(saveNew, '_saving = false') >= 1,
+      'A5c ★ P05 新建路径：写库调用**唯一** `upsertWorkRecord(` 恰 1、不含 `updateWorkRecordMeta(`；'
+      '`_saving` 置位/复位双向闭合（防连点重复入账 / 防按钮卡死）[GAP-45]',
+      'upsert=${_count(saveNew, 'upsertWorkRecord(')} '
+          'updateMeta=${_count(saveNew, 'updateWorkRecordMeta(')} '
+          'set=${_count(saveNew, '_saving = true')} '
+          'reset=${_count(saveNew, '_saving = false')}');
+  _check(
+      saveEdit.isNotEmpty &&
+          _count(saveEdit, 'updateWorkRecordMeta(') == 1 &&
+          _count(saveEdit, 'upsertWorkRecord(') == 0 &&
+          _count(saveEdit, '_saving = true') >= 1 &&
+          _count(saveEdit, '_saving = false') >= 1,
+      'A5d ★ P05 编辑路径：写库调用**唯一** `updateWorkRecordMeta(` 恰 1、不含 `upsertWorkRecord(`'
+      '（编辑不得插新行）；`_saving` 双向闭合 [GAP-45]',
+      'updateMeta=${_count(saveEdit, 'updateWorkRecordMeta(')} '
+          'upsert=${_count(saveEdit, 'upsertWorkRecord(')} '
+          'set=${_count(saveEdit, '_saving = true')} '
+          'reset=${_count(saveEdit, '_saving = false')}');
+
+  // A5e **GAP-41**：跨夜归属日推导（此前完全无断言）
+  //   机制链：`_combineTime` 用**归属日**拼起止两个 DateTime（两侧日期相同，只差 hh:mm）
+  //   → 引擎 `_durationMinutes` **只比较 hour/minute** + `overnight` 标记补 1440 分钟
+  //   → 落库 `attribution_date = _dateOnly(x.workDate)`。
+  //   ⚠️ 这里守住两个"一旦改坏就静默出错"的点：
+  //     ① 若把 `end` 改成 `_workDate + 1天`（看似更"自然"的跨夜写法），引擎按注释会
+  //        **再补 1440 分钟 → 时长双计 24h**（`amount_engine.dart:204` 的注释明确警告过）。
+  //     ② 若把 `attribution_date` 改成取 `endTime` 的日期，跨夜记录就会归到**第二天**，
+  //        日历/统计的口径全部偏移一天。
+  final combineTime = _slice(workForm, 'DateTime? _combineTime(TimeOfDay? t)',
+      '/// 数量输入框的「格式」错误');
+  _check(
+      combineTime.isNotEmpty &&
+          _count(combineTime, '_workDate.year, _workDate.month, _workDate.day') == 1 &&
+          !combineTime.contains('_workDate.add(') &&
+          !combineTime.contains('Duration(days: 1)'),
+      'A5e ★ 跨夜：`_combineTime` 起止**同用归属日**拼装（`_workDate.year/month/day` 恰 1），'
+      '**不得**对 end 加一天（否则引擎按只比时分的语义会双计 24h）[GAP-41 / AC-08]',
+      'len=${combineTime.length} '
+          'anchor=${_count(combineTime, '_workDate.year, _workDate.month, _workDate.day')} '
+          'plusDay=${combineTime.contains('_workDate.add(')}');
+  _check(
+      _count(_stripComments(_read('lib/db/database.dart')),
+              "'attribution_date': _dateOnly(x.workDate)") ==
+          1,
+      'A5f ★ 跨夜归属日落库：`attribution_date` 取 **workDate 的日期部分**'
+      '（`_dateOnly(x.workDate)`，非 endTime 日期）恰 1 [GAP-41]',
+      '命中=${_count(_stripComments(_read('lib/db/database.dart')), "'attribution_date': _dateOnly(x.workDate)")}');
 
   // A6：work_form_page 的 D 接线 + 预览倍率（D1-b / D1-c）
   //   ★ 逐处精确断言（取代旧「计数 ≥4」）：单点写反（`isHoliday: _dayCtx.isWeekend`）

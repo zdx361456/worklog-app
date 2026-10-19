@@ -30,6 +30,16 @@
 ///     三处 `listCompanies` 双 `true`（F3a/F3b/F3c）、下钻 `RecordsFilter` 实参（F2a/F2b）、
 ///     点卡片→P07 等 U-4 接线。手法与 `tool/verify_waveD2.dart` 静态层一致（剥注释 + 切方法体 + 精确计数）。
 ///
+/// **【未覆盖】须末次出包真机验收的项（本脚本不能替代）**：
+///  - **AC-P01-01**：三家公司卡片在真机上**全部出现**，停用/归档公司带**灰色角标**且渲染正确；
+///  - **AC-P01-14（U-4 闸门，用户原始诉求）**：真机点公司卡片能看到明细、点三个金额能看到对应列表
+///    —— 本脚本只能静态证明「接线参数写对了」，**不能证明用户真的点得进去**；
+///  - **P-DEBT「0 家 / 1 家」的可视边界**：本脚本 §10 只做结构性论证（空集合 fold 恒 0、头行无条件渲染、
+///    专属空态视图存在），**没有真跑隔离夹具**（`aggregateByCompany()` 无 `ledgerId` 参数、
+///    `aggregate(null)` 亦为全账本 ⇒ 同进程内造不出「0 家公司」）；
+///  - 任何依赖渲染/滚动的观感项（字体溢出、色值观感）。
+///  > 依据：`docs/08-验证脚本断言强度审计/07-覆盖缺口闭环台账.md` §四「真机档清单」。
+///
 /// **测试数据（整数「分」，刻意让四种形态同时出现）**：
 /// ```
 /// 公司 A 启用     : 应收 100000+50000 = 150000，已收 40000          → 剩余  +110000（最大欠款）
@@ -492,6 +502,56 @@ Future<void> main() async {
       '含欠款合计=${debtSrc.contains('欠款合计')} '
           '含口径标注=${debtSrc.contains('欠款合计 ≠ 看板「剩余工资」')}',
     );
+    // ── GAP-33：P-DEBT 排序方向（此前只断「口径」，不断「倒序」）─────────────
+    check(
+      '⑩③-2 P-DEBT 欠款行按 remaining **倒序**（切片 _load 内 '
+      '`rows.sort((a, b) => b.agg.remaining.compareTo(a.agg.remaining))` 恰 1，且无升序变体）'
+      '[GAP-33 / AC-PDBT-02]',
+      _count(debtLoad,
+              'rows.sort((a, b) => b.agg.remaining.compareTo(a.agg.remaining))') ==
+              1 &&
+          _count(debtLoad,
+                  'rows.sort((a, b) => a.agg.remaining.compareTo(b.agg.remaining))') ==
+              0,
+      'desc=${_count(debtLoad, 'rows.sort((a, b) => b.agg.remaining.compareTo(a.agg.remaining))')} '
+          'asc=${_count(debtLoad, 'rows.sort((a, b) => a.agg.remaining.compareTo(b.agg.remaining))')}',
+    );
+    // ── GAP-34：P-DEBT 行点击 → P07（此前只断「页面标注」，不断「下钻链路」）──
+    final debtOpen = _blockAfter(debtSrc, 'Future<void> _openDetail(Company company)');
+    check(
+      '⑩③-3 P-DEBT 行点击 → P07：`_openDetail` 体内 `CompanyDetailPage(companyId: company.id)` 恰 1；'
+      '两处行 `onTap` 均接 `_openDetail(row.company)`、行 tile 透传 `onTap: onTap`'
+      '[GAP-34 / AC-PDBT-04]',
+      _count(debtOpen, 'CompanyDetailPage(companyId: company.id)') == 1 &&
+          _count(debtSrc, 'onTap: () => _openDetail(row.company)') == 2 &&
+          _count(debtSrc, 'onTap: onTap') == 1,
+      'cdp=${_count(debtOpen, 'CompanyDetailPage(companyId: company.id)')} '
+          'rowTap=${_count(debtSrc, 'onTap: () => _openDetail(row.company)')} '
+          'tilePassthru=${_count(debtSrc, 'onTap: onTap')}',
+    );
+    // ── GAP-19：P-DEBT「0 家 / 1 家」边界的**静态代理** ────────────────────
+    //   ⚠️ 证据级别 = 【读码/静态】：`aggregateByCompany()` 无 `ledgerId` 参数、
+    //      `aggregate(null)` 也是全账本，**同一进程内无法造出「0 家公司」的隔离夹具**
+    //      （加一个空账本不会让 aggregateByCompany 变空）。故此处只做**结构性论证**：
+    //      ① 空集合 `fold<int>(0, …)` 恒得 0，不抛 → 0 家时合计为 0 而非崩溃；
+    //      ② 「共 N 家公司 · 欠款合计」头行渲染在 `if (rows.isEmpty)` **之前**（无条件渲染）
+    //         → 0 家时显示「共 0 家 · ¥0.00」，而不是整页空白；
+    //      ③ 0 家有专属空态视图（AC-PDBT-06）。
+    //      **行为级边界（真 0 家 / 真 1 家）仍需独立 DB 夹具或真机**，如实归入真机档。
+    final buildDebt = _blockAfter(debtSrc, 'Widget _buildDebt()');
+    check(
+      '⑩③-4 P-DEBT 0 家边界（静态代理）：合计由 `rows.fold<int>(0, …)` 求（空集恒 0、不抛）；'
+      '头行「共 N 家 · 欠款合计」**先于** `if (rows.isEmpty)` 渲染（0 家显示 ¥0.00 而非空白）；'
+      '0 家有专属 `_EmptyDebtView(` [GAP-19 / AC-PDBT-06]',
+      _count(debtLoad, 'rows.fold<int>(0, (s, r) => s + r.agg.remaining)') == 1 &&
+          buildDebt.isNotEmpty &&
+          _count(buildDebt, 'if (rows.isEmpty)') == 1 &&
+          _count(buildDebt, '_EmptyDebtView(') == 1 &&
+          buildDebt.indexOf('_HeaderLine(') < buildDebt.indexOf('if (rows.isEmpty)') &&
+          buildDebt.contains('共 \${rows.length} 家公司'),
+      'fold=${_count(debtLoad, 'rows.fold<int>(0, (s, r) => s + r.agg.remaining)')} '
+          'hdr=${buildDebt.indexOf('_HeaderLine(')} empty=${buildDebt.indexOf('if (rows.isEmpty)')}',
+    );
 
     // ── F2a/F2b：下钻 filter 实参（切片各方法体）──────────────────────────
     final recvBody = _blockAfter(ovw, 'Future<void> _openReceivableDrill()');
@@ -524,6 +584,17 @@ Future<void> main() async {
       _count(payListBody, 'filter: RecordsFilter.companyPayment(widget.companyId)') == 1,
       '命中=${_count(payListBody, 'filter: RecordsFilter.companyPayment(widget.companyId)')}',
     );
+    // ── GAP-21：P07 概览「剩余」取值来源（此前无人断言它取的是 remaining）──
+    check(
+      '⑩⑦-2 P07 概览「剩余」取自 `agg?.remaining`（不得误取 receivable / received）'
+      '[GAP-21 / AC-P07-02]',
+      _count(cdp, 'final remaining = agg?.remaining ?? 0;') == 1 &&
+          !cdp.contains('final remaining = agg?.receivable') &&
+          !cdp.contains('final remaining = agg?.received') &&
+          !cdp.contains('final remaining = agg?.receivable - '),
+      'remaining=${_count(cdp, 'final remaining = agg?.remaining ?? 0;')} '
+          '误取receivable=${cdp.contains('final remaining = agg?.receivable')}',
+    );
 
     // ── F3a/F3b/F3c：三页公司元数据禁裸调（精确计数，剥离注释）─────────────
     check(
@@ -542,6 +613,24 @@ Future<void> main() async {
       '双true=${_count(compSrc, doubleTrue)} 裸调=${_count(compSrc, 'listCompanies()')}',
     );
 
+    // ── GAP-20：P01 空态主按钮文案 + 出口（此前无任何断言）──────────────────
+    final emptyView = _blockAfter(ovw, 'class _EmptyView extends StatelessWidget');
+    final goCreate = _blockAfter(ovw, 'Future<void> _goCreateCompany()');
+    check(
+      '⑩⑩-2 P01 空态：标题「还没有公司」+ 主按钮文案「先建一个公司」'
+      '（AC-P01-11 / `07:240`，与标题**不同字**），且 `onPressed: onCreateCompany` 恰 1；'
+      '出口 `_goCreateCompany` → `pushNamed(Routes.companies)` 恰 1'
+      '[GAP-20 / AC-P01-11]',
+      emptyView.contains("'还没有公司'") &&
+          emptyView.contains("'先建一个公司'") &&
+          _count(emptyView, 'onPressed: onCreateCompany') == 1 &&
+          !emptyView.contains('暂无记录') &&
+          _count(goCreate, 'pushNamed(Routes.companies)') == 1,
+      '标题=${emptyView.contains("'还没有公司'")} '
+          '按钮文案=${emptyView.contains("'先建一个公司'")} '
+          '接线=${_count(emptyView, 'onPressed: onCreateCompany')} '
+          '出口=${_count(goCreate, 'pushNamed(Routes.companies)')}',
+    );
     // ── U-4 下钻接线（点卡片 → P07 / 剩余工资 → P-DEBT / 按钮接线）──────────
     final openCompBody = _blockAfter(ovw, 'Future<void> _openCompanyDetail(Company c)');
     check(

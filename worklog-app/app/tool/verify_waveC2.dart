@@ -458,6 +458,50 @@ Future<void> main() async {
           assertBody.contains('includeDraft: true'),
       'len=${assertBody.length} incDel=${_reCount(assertBody, RegExp(r"includeDeleted:\s*true"))}');
 
+  // ── §2c 坏行检测实参切片（**堵 R-83**）────────────────────────────────
+  //   二轮独立注入暴露的**残余盲区**（`08-06` 登记 R-83）：`_load()` 里的容错读
+  //   `db.listWorkRecordsLenient(includeDraft: true)`（`:81-84` 整段调用）是「草稿行损坏」告警
+  //   （AC-P13-11 黄色提示条）的**唯一来源**。注入把 true→false ⇒ 脚本仍 69/0（全绿），
+  //   因为 §2/§2b 只覆盖 `_buildBackupData()`，从不触达 `_load()`。
+  //   语义：漏草稿坏行 = **退化非数据错**（备份本身仍全量，只是少了条脏行提示），故定 P3；
+  //   但「可被脚本证伪却没有断言」正是审计要清的假覆盖形态 ⇒ 一并补上。
+  final loadBody = _blockAfter(pageCode, 'Future<void> _load() async {');
+  check('A7★ 交付页 `_load()` 方法体可切片（源码锚点存在）',
+      loadBody.isNotEmpty, 'len=${loadBody.length}');
+  final lWorks = _parenAfter(loadBody, 'db.listWorkRecordsLenient(');
+  final lPays = _parenAfter(loadBody, 'db.listPaymentRecordsLenient(');
+  check('A8★ 交付页 `_load()` 容错读 listWorkRecordsLenient 含 includeDraft:true（**改 false 必红**，堵 R-83）',
+      lWorks.contains('includeDeleted: true') &&
+          lWorks.contains('includeDraft: true') &&
+          !lWorks.contains('includeDraft: false'),
+      lWorks.replaceAll('\n', ' '));
+  check('A9★ 交付页 `_load()` 容错读 listPaymentRecordsLenient 含 includeDeleted:true',
+      lPays.contains('includeDeleted: true'), lPays.replaceAll('\n', ' '));
+  // A10★（独立审查 R1 提出）：`_parenAfter` 只取**首命中**。若 `_load()` 内先放一条死分支
+  //   调用（参数全对但永不执行），真调用再写错参，A8★ 仍会绿 —— 三处注入实测证实该逃逸可行。
+  //   故补一条「该调用在方法体内恰 1 处」，把「首命中」升级为「唯一命中」。
+  final lWorksN = _reCount(loadBody, RegExp(r'db\.listWorkRecordsLenient\('));
+  final lPaysN = _reCount(loadBody, RegExp(r'db\.listPaymentRecordsLenient\('));
+  check('A10★ 交付页 `_load()` 内两条容错读**各恰 1 处**（防死分支诱饵，护 A8★/A9★ 的唯一性）',
+      lWorksN == 1 && lPaysN == 1, 'works=$lWorksN pays=$lPaysN');
+  // A11★（独立审查 R1 提出）：A8★ 只断「调用长什么样」，**不断结果有没有被用**。
+  //   实测：只把 `_badRowCount` 的右值改成 `0`（一个 token），A7/A8/A9 全绿，而
+  //   AC-P13-11「N 行异常数据」提示条整条功能失效 —— 属「断言只锚调用写法、不锚价值链」的旧病复发。
+  //   故补消费链：右值必须同时消费两侧 skippedCount（漏一侧 ⇒ 草稿或收款坏行漏报）。
+  final bcAssign = RegExp(r'_badRowCount\s*=\s*([^;]*);').firstMatch(loadBody);
+  final bcRhs = bcAssign?.group(1) ?? '';
+  check('A11★ 坏行计数消费链：`_badRowCount` 右值同时消费 `w.skippedCount` 与 `p.skippedCount`'
+          '（**改 0 必红**，AC-P13-11）',
+      bcRhs.contains('w.skippedCount') &&
+          bcRhs.contains('p.skippedCount') &&
+          !RegExp(r'_badRowCount\s*=\s*0\s*;').hasMatch(loadBody),
+      'rhs=${bcRhs.trim()}');
+  // A12★：消费链的第二环 —— 计数必须真的驱动提示条渲染。计数对了但条件写反/删掉，
+  //   用户同样看不到告警。锚定「条件 + 紧随其后的 `_warnBar(`」这一对语义。
+  final warnGate = RegExp(r'if\s*\(\s*_badRowCount\s*>\s*0\s*\)\s*_warnBar\(');
+  check('A12★ 坏行提示条渲染：`if (_badRowCount > 0)` 后紧随 `_warnBar(`（AC-P13-11 用户可见）',
+      _reCount(pageCode, warnGate) == 1, 'hit=${_reCount(pageCode, warnGate)}');
+
   // A5 一致性断言（AC-61）
   final export = const ExportService();
   final fixedAt = DateTime(2026, 9, 30, 12, 0);
@@ -725,13 +769,15 @@ Future<void> main() async {
       softWarnClean.any((e) => e.contains('软删')), '$softWarnClean');
   final collectLocalBody =
       _blockAfter(pageCode, 'Future<Set<String>> _collectLocalIds()');
-  check('AC-P13-07 交付页 `_collectLocalIds` 覆盖六表且四表带 includeDeleted:true',
+  check('AC-P13-07 交付页 `_collectLocalIds` 覆盖六表且**四表**带 includeDeleted:true'
+          '（GAP-47：原 `>= 2` 阈值过宽，实测实现为 4，改为精确等值）',
       collectLocalBody.contains('listCompanies(') &&
           collectLocalBody.contains('listPricingRules(') &&
           collectLocalBody.contains('listWorkRecordsLenient(') &&
           collectLocalBody.contains('listPaymentRecordsLenient(') &&
           collectLocalBody.contains('listHolidayMarks(') &&
-          _reCount(collectLocalBody, RegExp(r'includeDeleted:\s*true')) >= 2,
+          collectLocalBody.contains('includeDraft: true') &&
+          _reCount(collectLocalBody, RegExp(r'includeDeleted:\s*true')) == 4,
       'len=${collectLocalBody.length} incDel=${_reCount(collectLocalBody, RegExp(r"includeDeleted:\s*true"))}');
   final runImportBody = _blockAfter(pageCode, 'Future<void> _runImport(');
   check('AC-P13-07 交付页 `_runImport` 调 `planImport(` 并**消费** `plan.abort`',

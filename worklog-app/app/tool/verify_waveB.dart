@@ -784,6 +784,28 @@ Future<void> main() async {
     check('⑫ _target() 重算体不含 listPricingRules（禁读现价，AC-P05-10）',
         targetBody.isNotEmpty && !targetBody.contains('listPricingRules'),
         '重算体内出现 listPricingRules 或片段未定位');
+    // ⑫-2 **GAP-46**：§4 的复刻体用常量（`name: '（快照重建）'` / 固定 halfDayRatio），
+    //   而真页面取的是 `_ruleName ?? ''` 与 `_halfDayRatio(rec)`。复刻体与页面**不等价**时，
+    //   §4 的「复刻实测通过」就不能当成页面行为的证据。此处把**页面侧的真实取数**钉住，
+    //   使复刻体与页面之间的那一格不再无人看管。
+    final halfRatioBody =
+        _slice(p05Code, 'int _halfDayRatio(WorkRecord rec)', 'RecordStatus _targetStatus(');
+    check('⑫-2 record_detail `_target()` 的 rule.name 取 `_ruleName ?? \'\'`（非常量）'
+        '[GAP-46]',
+        targetBody.contains("name: _ruleName ?? ''") &&
+            !targetBody.contains("name: '（快照重建）'") &&
+            !targetBody.contains("name: '"),
+        'name 取法=${targetBody.contains("name: _ruleName ?? ''")} '
+            '含常量=${targetBody.contains("name: '")}');
+    check('⑫-3 record_detail `_target()` 的 halfDayRatio 取 `_halfDayRatio(rec)`（非固定 5），'
+        '且 `_halfDayRatio` 对 daily 由 `qtySnapshot × 10` 反推、非 daily 返 5 [GAP-46]',
+        targetBody.contains('halfDayRatio: _halfDayRatio(rec)') &&
+            !targetBody.contains('halfDayRatio: 5') &&
+            halfRatioBody.isNotEmpty &&
+            halfRatioBody.contains('rec.qtySnapshot * 10') &&
+            halfRatioBody.contains('PricingMethod.daily'),
+        'target=${targetBody.contains('halfDayRatio: _halfDayRatio(rec)')} '
+            'body=${halfRatioBody.length}');
 
     // P03：日历口径 + 色点补 alpha + **容错读**（一律作用于剥注释源码 p03Code）。
     check('⑬ calendar_page 用**容错读** listWorkRecordsLenient(（M-01）',

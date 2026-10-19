@@ -201,6 +201,43 @@ void main() {
   final emptyLoad = RegExp(r'Future<void>\s+_load\(\)\s+async\s*\{\s*return;\s*\}');
   final emptyLoad2 = RegExp(r'Future<void>\s+_load\(\)\s+async\s*\{\s*\}');
 
+  // ── 已填充页的「**数据接线**」判据（v2，替代「`_load()` 非空」判据）────────────
+  //   独立审查（2026-10-19）实测：v1 判据只认 `{}` / `{ return; }` 两种语法形态，
+  //   把 `_load()` 换成下面四种「假加载」形态**全部仍判为通过**：
+  //     ① `{ setState(() {}); }`　② `{ /* 什么都不做 */ }`
+  //     ③ `{ _loading = false; return; }`　④ `{ _records = []; }`（空列表假数据）
+  //   最坏情形实测：把 `settings_page._load()` 的**整段取数搬空**，10 个脚本全绿
+  //   —— 因为 `tool/` 下没有任何脚本断言过 settings 页调用 `getLedger`。
+  //   这就是「断言跟着代码形状走、不跟着价值链走」的老病（与上一轮 34 处假覆盖同族）。
+  //   故改为**按页面锚定它唯一的数据来源调用 + 状态落位 + 渲染出口**（写死 needle），
+  //   上述四种形态会同时因「缺取数调用」而变红。
+  const loadWiring = <String, List<String>>{
+    // [数据来源调用, …（可多条）, 状态落位, 渲染出口]
+    'lib/ui/calendar_page.dart': [
+      '_db.listWorkRecordsLenient(',
+      'lenient.skipped', // 坏行计数必须取自容错读（AC-P03 / 坏行提示的来源）
+      '_byDay = ',
+      'setState(',
+    ],
+    'lib/ui/stats_page.dart': [
+      '_db.listWorkRecords(',
+      '_db.aggregateByCompany(',
+      '_records = ',
+      'setState(',
+    ],
+    'lib/ui/settings_page.dart': [
+      '_db.getLedger(',
+      '_ledger = ',
+      'setState(',
+    ],
+  };
+  // 每页「主取数调用」——必须在 `_load()` 内**恰 1 处**（防死分支诱饵：先放一条永不执行的调用）。
+  const loadPrimary = <String, String>{
+    'lib/ui/calendar_page.dart': '_db.listWorkRecordsLenient(',
+    'lib/ui/stats_page.dart': '_db.aggregateByCompany(',
+    'lib/ui/settings_page.dart': '_db.getLedger(',
+  };
+
   placeholders.forEach((path, meta) {
     final name = meta.$1;
     final wave = meta.$2;
@@ -209,36 +246,70 @@ void main() {
       _bad('$path 存在', '文件不存在或为空');
       return;
     }
+    // 语义判定一律走**剥注释**后的代码：注释里出现「建设中」/「Scaffold(」不该翻转结论
+    // （否则是「假红」—— 断言方向对但判据脏）。
+    final srcCode = _stripComments(src);
     // ── 结构不变量：填充后仍必须成立（`MainShell._pages` 是 `static const`）──
     _check(
-      src.contains('class $name extends StatefulWidget'),
+      srcCode.contains('class $name extends StatefulWidget'),
       '$path：$name 为 StatefulWidget（可原位填充）',
       '未找到 `class $name extends StatefulWidget`',
     );
     _check(
-      src.contains('const $name({super.key})'),
+      srcCode.contains('const $name({super.key})'),
       '$path：构造签名 const $name({super.key})（_pages 依赖，填充后不得改）',
       '构造签名不匹配',
     );
     _check(
-      src.contains('Scaffold(') && src.contains('AppBar('),
+      srcCode.contains('Scaffold(') && srcCode.contains('AppBar('),
       '$path：保留 Scaffold / AppBar 外壳（原位填充不得重建）',
       '缺少 Scaffold 或 AppBar',
     );
-    // ── 占位态条件式：仅当**仍含「建设中」**时才校验占位态约束 ──
-    if (src.contains('建设中')) {
+    // ── 填充态 / 占位态：**显式判定当前态**，不再「条件式静默跳过」──
+    //    ★ 加固（空断言转守卫）：原实现为
+    //        `if (src.contains('建设中')) { 占位约束 } else { _ok(…退役…) }`
+    //      ⇒ 任何人把页面**退回占位态**，脚本仍全绿（退回后走占位分支，而占位分支本就通过）。
+    //      即「占位态已退役」这件事**不可证伪** —— 属审计判定的「空断言」。
+    //      改为：先断言「已填充」本身（退回即红），再按当前态施加对应约束。
+    final filled = !srcCode.contains('建设中');
+    _check(
+      filled,
+      '$path：已由 $wave 原位填充（占位态已退役；**退回占位态则本断言变红**）',
+      '仍含「建设中」→ 该页退回占位态，违反 AC-A2-03「原位填充、不得删除重建」',
+    );
+    if (filled) {
+      // 半填充守卫 v2 = **数据接线判据**（见上方 `loadWiring` 说明）。
+      final loadBody = _blockAfter(srcCode, 'Future<void> _load() async');
       _check(
-        emptyLoad.hasMatch(src) || emptyLoad2.hasMatch(src),
+        loadBody.isNotEmpty,
+        '$path：`_load()` 方法体可切片（数据接线判据的前置）',
+        '未找到 `Future<void> _load() async` 或花括号不配对',
+      );
+      final need = loadWiring[path] ?? const <String>[];
+      final missing = need.where((n) => !loadBody.contains(n)).toList();
+      _check(
+        loadBody.isNotEmpty && missing.isEmpty,
+        '$path：已填充页 `_load()` **数据接线完整**（${need.length} 个必备锚点全含）',
+        '缺失：$missing —— 页面在、数据未接（假加载 / 半填充）',
+      );
+      final primary = loadPrimary[path] ?? '';
+      final pn = _count(loadBody, primary);
+      _check(
+        pn == 1,
+        '$path：`_load()` 内主取数调用 `$primary` 恰 1 处（防死分支诱饵）',
+        '实际 $pn 处',
+      );
+    } else {
+      _check(
+        emptyLoad.hasMatch(srcCode) || emptyLoad2.hasMatch(srcCode),
         '$path：仍是占位页 → _load() 必须为空实现（AC-A2-05 启动期零 DB 读）',
         '_load() 非空实现 —— 占位页不得在启动期读库',
       );
       _check(
-        src.contains(wave),
+        srcCode.contains(wave),
         '$path：仍是占位页 → 标注预期交付波次「$wave」（AC-A2-02）',
         '未找到「$wave」字样',
       );
-    } else {
-      _ok('$path：已由 $wave 原位填充 → 占位态断言按 AC-A2-03 设计退役（结构不变量仍校验）');
     }
   });
 

@@ -184,6 +184,63 @@ void _run() {
     );
     check('跨夜 22:00→06:00 = 8h = 32000分', r.amount == 32000, '实际 ${r.amount}');
   }
+  // ── GAP-05：跨夜边界算例补密（原有 1 例 + AC-11 1 例，密度不足）──────────────
+  //   引擎口径来自 `amount_engine.dart:204-212`：**只比较 hour/minute**（忽略日期），
+  //   `overnight: true` 时 `mins += 24*60`；`mins < 0` → needsOvernightConfirm；
+  //   `mins == 0` → `_draft`（AC-12）。下面四条把这三条分支的**边界**各钉一次。
+  {
+    // ① 跨午夜但两端都不是整点：23:00 → 01:00 = 2h（验证 +1440 后仍按分钟计）
+    final r = eng.compute(
+      rule: rule(method: PricingMethod.hourly, baseRate: 4000),
+      input: AmountInput(
+        start: DateTime(2026, 9, 30, 23, 0),
+        end: DateTime(2026, 9, 30, 1, 0), // 同日 DateTime！只差时分
+        overnight: true,
+      ),
+    );
+    check('GAP-05① 跨夜 23:00→01:00（同日 DateTime）= 2h = 8000分', r.amount == 8000,
+        '实际 ${r.amount}');
+  }
+  {
+    // ② 同刻 + 勾跨夜 = 整 24h（1440 分钟）—— 语义直接来自 `mins += 24*60`
+    final r = eng.compute(
+      rule: rule(method: PricingMethod.hourly, baseRate: 4000),
+      input: AmountInput(
+        start: DateTime(2026, 9, 30, 8, 0),
+        end: DateTime(2026, 9, 30, 8, 0),
+        overnight: true,
+      ),
+    );
+    check('GAP-05② 同刻 08:00→08:00 + 跨夜 = 24h = 96000分（不是 0）', r.amount == 96000,
+        '实际 ${r.amount}');
+  }
+  {
+    // ③ 同刻 + 不勾跨夜 = 0 → `_draft`（AC-12「0 时长不产生金额」）
+    final r = eng.compute(
+      rule: rule(method: PricingMethod.hourly, baseRate: 4000),
+      input: AmountInput(
+        start: DateTime(2026, 9, 30, 8, 0),
+        end: DateTime(2026, 9, 30, 8, 0),
+        overnight: false,
+      ),
+    );
+    check('GAP-05③ 同刻 08:00→08:00 未跨夜 → isDraft 且 amount == 0（AC-12）',
+        r.isDraft && r.amount == 0, 'isDraft=${r.isDraft} amount=${r.amount}');
+  }
+  {
+    // ④ 典型跨夜时段但**漏勾**跨夜 → 负时长 → 必须走「请确认跨夜」而不是算出负数金额
+    final r = eng.compute(
+      rule: rule(method: PricingMethod.hourly, baseRate: 4000),
+      input: AmountInput(
+        start: DateTime(2026, 9, 30, 22, 0),
+        end: DateTime(2026, 9, 30, 6, 0),
+        overnight: false,
+      ),
+    );
+    check('GAP-05④ 22:00→06:00 漏勾跨夜 → needsOvernightConfirm（AC-11），不得出负数金额',
+        r.needsOvernightConfirm && r.amount == 0,
+        'flag=${r.needsOvernightConfirm} amount=${r.amount}');
+  }
   {
     final r = eng.compute(
       rule: rule(method: PricingMethod.hourly, baseRate: 4000),
